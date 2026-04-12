@@ -67,7 +67,7 @@ export function setupWebSocket(server: Server): WebSocketServer {
             detectedLanguage: Math.random() > 0.7 ? "hi" : "en",
             codeSwitchCount: Math.floor(Math.random() * 3),
           },
-        });
+        }, ws);
       }, 8000);
     }
 
@@ -76,9 +76,7 @@ export function setupWebSocket(server: Server): WebSocketServer {
         const msg = JSON.parse(data.toString());
         handleMessage(callId, role, msg, ws);
       } catch {
-        if (data instanceof Buffer || data instanceof ArrayBuffer) {
-          broadcastAudio(callId, data, ws);
-        }
+        // ignore non-JSON binary
       }
     });
 
@@ -110,15 +108,13 @@ function handleMessage(callId: string, role: string, msg: any, senderWs: WebSock
     broadcastToCall(callId, { type: "transcript", role, text: msg.text, language: msg.language, confidence: msg.confidence });
   } else if (msg.type === "operator_action") {
     broadcastToCall(callId, { type: "operator_action", action: msg.action });
-  }
-}
-
-function broadcastAudio(callId: string, data: Buffer | ArrayBuffer, senderWs: WebSocket) {
-  const callClients = clients.get(callId) || [];
-  for (const client of callClients) {
-    if (client.ws !== senderWs && client.ws.readyState === WebSocket.OPEN) {
-      client.ws.send(data);
-    }
+  } else if (
+    msg.type === "webrtc_offer" ||
+    msg.type === "webrtc_answer" ||
+    msg.type === "webrtc_ice_candidate"
+  ) {
+    // relay WebRTC signaling to the other party only
+    broadcastToCall(callId, { ...msg, fromRole: role }, senderWs);
   }
 }
 

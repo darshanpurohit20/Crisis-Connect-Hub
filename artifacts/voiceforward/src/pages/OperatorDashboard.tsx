@@ -71,14 +71,14 @@ function RiskGauge({ score, level }: { score: number; level: string }) {
   );
 }
 
-function Waveform({ active }: { active: boolean }) {
+function Waveform({ active, heights }: { active: boolean; heights?: number[] }) {
   return (
     <div className="flex items-center justify-center gap-0.5 h-8">
       {Array.from({ length: 16 }).map((_, i) => (
         <div
           key={i}
-          className={cn("w-0.5 rounded-full transition-all", active ? "bg-primary waveform-bar" : "bg-border")}
-          style={{ height: active ? undefined : "4px" }}
+          className={cn("w-0.5 rounded-full transition-all duration-75", active ? "bg-primary" : "bg-border")}
+          style={{ height: active && heights ? `${heights[i]}px` : active ? undefined : "4px" }}
         />
       ))}
     </div>
@@ -99,8 +99,14 @@ export default function OperatorDashboard() {
   const [showReasoning, setShowReasoning] = useState(false);
   const [activeTab, setActiveTab] = useState<"insights" | "resources">("insights");
   const [isMuted, setIsMuted] = useState(false);
+  const [waveHeights, setWaveHeights] = useState<number[]>(Array(16).fill(4));
   const wsRef = useRef<WebSocket | null>(null);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
+  const pcRef = useRef<RTCPeerConnection | null>(null);
+  const localStreamRef = useRef<MediaStream | null>(null);
+  const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const animFrameRef = useRef<number | null>(null);
 
   const { data: queue, refetch: refetchQueue } = useGetQueue({ query: { refetchInterval: 3000 } });
   const { data: operators } = useListOperators({ query: { refetchInterval: 5000 } });
@@ -122,10 +128,40 @@ export default function OperatorDashboard() {
     if (!session) { navigate("/operator/login"); return; }
   }, []);
 
+  function startWaveform(stream: MediaStream) {
+    const ctx = new AudioContext();
+    const source = ctx.createMediaStreamSource(stream);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 64;
+    source.connect(analyser);
+    analyserRef.current = analyser;
+    const data = new Uint8Array(analyser.frequencyBinCount);
+    function tick() {
+      analyser.getByteFrequencyData(data);
+      const bars = Array.from({ length: 16 }, (_, i) => {
+        const val = data[Math.floor(i * data.length / 16)] || 0;
+        return Math.max(4, (val / 255) * 32);
+      });
+      setWaveHeights(bars);
+      animFrameRef.current = requestAnimationFrame(tick);
+    }
+    tick();
+  }
+
+  function cleanupWebRTC() {
+    if (animFrameRef.current) { cancelAnimationFrame(animFrameRef.current); animFrameRef.current = null; }
+    localStreamRef.current?.getTracks().forEach(t => t.stop());
+    localStreamRef.current = null;
+    pcRef.current?.close();
+    pcRef.current = null;
+    setWaveHeights(Array(16).fill(4));
+  }
+
   useEffect(() => {
     if (!activeCallId) {
       if (wsRef.current) { wsRef.current.close(); wsRef.current = null; }
       if (timerRef.current) clearInterval(timerRef.current);
+      cleanupWebRTC();
       setElapsed(0);
       return;
     }
@@ -137,11 +173,60 @@ export default function OperatorDashboard() {
     ws.onopen = () => setWsConnected(true);
     ws.onclose = () => setWsConnected(false);
 
-    ws.onmessage = (event) => {
+    ws.onmessage = async (event) => {
       try {
         const msg = JSON.parse(event.data);
+
         if (msg.type === "ai_insight") {
           setLiveInsight(msg.data as AIInsight);
+        }
+
+        if (msg.type === "webrtc_offer" && msg.sdp) {
+          // Operator receives offer → get mic → create answer
+          let stream = localStreamRef.current;
+          if (!stream) {
+            try {
+              stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+              localStreamRef.current = stream;
+              startWaveform(stream);
+            } catch (err) {
+              console.error("Operator mic access denied", err);
+            }
+          }
+
+          const pc = new RTCPeerConnection({ iceServers: [
+            { urls: "stun:stun.l.google.com:19302" },
+            { urls: "stun:stun1.l.google.com:19302" },
+          ]});
+          pcRef.current = pc;
+
+          if (stream) {
+            stream.getTracks().forEach(track => pc.addTrack(track, stream!));
+          }
+
+          pc.ontrack = (event) => {
+            if (remoteAudioRef.current) {
+              remoteAudioRef.current.srcObject = event.streams[0];
+            }
+          };
+
+          pc.onicecandidate = (e) => {
+            if (e.candidate && ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: "webrtc_ice_candidate", candidate: e.candidate }));
+            }
+          };
+
+          await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          ws.send(JSON.stringify({ type: "webrtc_answer", sdp: pc.localDescription }));
+        }
+
+        if (msg.type === "webrtc_ice_candidate" && msg.candidate) {
+          const pc = pcRef.current;
+          if (pc) {
+            try { await pc.addIceCandidate(new RTCIceCandidate(msg.candidate)); } catch {}
+          }
         }
       } catch {}
     };
@@ -162,9 +247,16 @@ export default function OperatorDashboard() {
     refetchQueue();
   }
 
+  function toggleMute() {
+    const next = !isMuted;
+    setIsMuted(next);
+    localStreamRef.current?.getAudioTracks().forEach(t => { t.enabled = !next; });
+  }
+
   async function holdCall() {
     if (!activeCallId) return;
     await updateState.mutateAsync({ callId: activeCallId, data: { state: "on_hold" } });
+    cleanupWebRTC();
     setActiveCallId(null);
     refetchQueue();
   }
@@ -172,6 +264,7 @@ export default function OperatorDashboard() {
   async function endCall() {
     if (!activeCallId) return;
     await updateState.mutateAsync({ callId: activeCallId, data: { state: "ended" } });
+    cleanupWebRTC();
     setActiveCallId(null);
     setLiveInsight(null);
     refetchQueue();
@@ -210,6 +303,9 @@ export default function OperatorDashboard() {
 
   return (
     <div className="h-screen bg-background flex flex-col overflow-hidden">
+      {/* Hidden audio element for remote caller voice */}
+      <audio ref={remoteAudioRef} autoPlay playsInline style={{ display: "none" }} />
+
       {/* Top nav */}
       <div className="h-12 border-b border-border flex items-center justify-between px-4 shrink-0">
         <div className="flex items-center gap-3">
@@ -349,10 +445,15 @@ export default function OperatorDashboard() {
                     AI disclosure: active
                   </div>
                   <button
-                    onClick={() => setIsMuted(m => !m)}
+                    onClick={toggleMute}
+                    title={isMuted ? "Unmute mic" : "Mute mic"}
                     className={cn("w-9 h-9 rounded-lg border flex items-center justify-center transition-colors", isMuted ? "bg-destructive/20 border-destructive text-destructive" : "border-border text-muted-foreground hover:text-foreground")}
                   >
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/></svg>
+                    {isMuted ? (
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><line x1="1" y1="1" x2="23" y2="23"/><path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6"/><path d="M17 16.95A7 7 0 0 1 5 12v-2"/></svg>
+                    ) : (
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/></svg>
+                    )}
                   </button>
                   <button onClick={holdCall} className="text-xs px-3 py-1.5 border border-amber-400/40 text-amber-400 rounded-md hover:bg-amber-400/10 transition-colors">Hold</button>
                   <button onClick={endCall} className="text-xs px-3 py-1.5 bg-destructive/10 border border-destructive/30 text-destructive rounded-md hover:bg-destructive/20 transition-colors">End call</button>
@@ -381,7 +482,7 @@ export default function OperatorDashboard() {
 
               {/* Waveform */}
               <div className="border-t border-border px-5 py-3">
-                <Waveform active={activeCall.state === "active" && !isMuted} />
+                <Waveform active={activeCall.state === "active" && !isMuted} heights={waveHeights} />
               </div>
             </>
           ) : (
