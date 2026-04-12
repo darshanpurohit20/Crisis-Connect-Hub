@@ -3,20 +3,30 @@ info:
   # Do not change the title, if the title changes, the import paths will be broken
   title: Api
   version: 0.1.0
-  description: API specification
+  description: VoiceForward Crisis Helpline Platform API
 servers:
   - url: /api
     description: Base API path
 tags:
   - name: health
     description: Health operations
+  - name: auth
+    description: Authentication and operator registration
+  - name: calls
+    description: Call management and queue
+  - name: operators
+    description: Operator management
+  - name: insights
+    description: AI insights and analytics
+  - name: queue
+    description: Call queue management
+
 paths:
   /healthz:
     get:
       operationId: healthCheck
       tags: [health]
       summary: Health check
-      description: Returns server health status
       responses:
         "200":
           description: Healthy
@@ -24,6 +34,366 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+
+  /auth/guest:
+    post:
+      operationId: createGuestSession
+      tags: [auth]
+      summary: Create a guest caller session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateGuestBody"
+      responses:
+        "201":
+          description: Guest session created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GuestSession"
+
+  /auth/operator/register:
+    post:
+      operationId: registerOperator
+      tags: [auth]
+      summary: Register a new operator
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegisterOperatorBody"
+      responses:
+        "201":
+          description: Operator registered
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperatorSession"
+
+  /auth/operator/login:
+    post:
+      operationId: loginOperator
+      tags: [auth]
+      summary: Login as operator
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginOperatorBody"
+      responses:
+        "200":
+          description: Operator logged in
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperatorSession"
+        "401":
+          description: Invalid credentials
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /calls:
+    get:
+      operationId: listCalls
+      tags: [calls]
+      summary: List all active calls
+      responses:
+        "200":
+          description: List of calls
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Call"
+
+    post:
+      operationId: createCall
+      tags: [calls]
+      summary: Create a new call (caller initiates)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateCallBody"
+      responses:
+        "201":
+          description: Call created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Call"
+
+  /calls/{callId}:
+    get:
+      operationId: getCall
+      tags: [calls]
+      summary: Get a specific call
+      parameters:
+        - name: callId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Call found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Call"
+
+  /calls/{callId}/state:
+    patch:
+      operationId: updateCallState
+      tags: [calls]
+      summary: Update call state (hold, active, end)
+      parameters:
+        - name: callId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateCallStateBody"
+      responses:
+        "200":
+          description: Call state updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Call"
+
+  /calls/{callId}/assign:
+    post:
+      operationId: assignOperatorToCall
+      tags: [calls]
+      summary: Assign an operator to a call
+      parameters:
+        - name: callId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AssignOperatorBody"
+      responses:
+        "200":
+          description: Operator assigned
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Call"
+
+  /calls/{callId}/transcript:
+    get:
+      operationId: getCallTranscript
+      tags: [calls]
+      summary: Get call transcript segments
+      parameters:
+        - name: callId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Transcript segments
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/TranscriptSegment"
+
+    post:
+      operationId: addTranscriptSegment
+      tags: [calls]
+      summary: Add a transcript segment
+      parameters:
+        - name: callId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AddTranscriptSegmentBody"
+      responses:
+        "201":
+          description: Segment added
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TranscriptSegment"
+
+  /calls/{callId}/insights:
+    get:
+      operationId: getCallInsights
+      tags: [insights]
+      summary: Get AI insights for a call
+      parameters:
+        - name: callId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Call insights
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CallInsights"
+
+    post:
+      operationId: updateCallInsights
+      tags: [insights]
+      summary: Update AI insights for a call
+      parameters:
+        - name: callId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateInsightsBody"
+      responses:
+        "200":
+          description: Insights updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CallInsights"
+
+  /calls/{callId}/resources:
+    get:
+      operationId: getNearbyResources
+      tags: [calls]
+      summary: Get nearby resources for a call location
+      parameters:
+        - name: callId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Nearby resources
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Resource"
+
+  /queue:
+    get:
+      operationId: getQueue
+      tags: [queue]
+      summary: Get current call queue
+      responses:
+        "200":
+          description: Queue status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueueStatus"
+
+  /operators:
+    get:
+      operationId: listOperators
+      tags: [operators]
+      summary: List all operators
+      responses:
+        "200":
+          description: List of operators
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Operator"
+
+  /operators/{operatorId}:
+    get:
+      operationId: getOperator
+      tags: [operators]
+      summary: Get a specific operator
+      parameters:
+        - name: operatorId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Operator found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Operator"
+
+  /operators/{operatorId}/status:
+    patch:
+      operationId: updateOperatorStatus
+      tags: [operators]
+      summary: Update operator availability status
+      parameters:
+        - name: operatorId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateOperatorStatusBody"
+      responses:
+        "200":
+          description: Status updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Operator"
+
+  /insights/dashboard:
+    get:
+      operationId: getDashboardInsights
+      tags: [insights]
+      summary: Get platform-wide dashboard insights
+      responses:
+        "200":
+          description: Dashboard insights
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DashboardInsights"
+
 components:
   schemas:
     HealthStatus:
@@ -34,3 +404,491 @@ components:
       required:
         - status
 
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+        message:
+          type: string
+      required:
+        - error
+        - message
+
+    CreateGuestBody:
+      type: object
+      properties:
+        name:
+          type: string
+        language:
+          type: string
+          enum: [en, hi, mr, ta, te, bn, gu, kn, ml, pa, mixed]
+          default: en
+      required:
+        - name
+
+    GuestSession:
+      type: object
+      properties:
+        sessionId:
+          type: string
+        callerId:
+          type: string
+        name:
+          type: string
+        language:
+          type: string
+        token:
+          type: string
+      required:
+        - sessionId
+        - callerId
+        - name
+        - language
+        - token
+
+    RegisterOperatorBody:
+      type: object
+      properties:
+        name:
+          type: string
+        email:
+          type: string
+        password:
+          type: string
+        organization:
+          type: string
+        languages:
+          type: array
+          items:
+            type: string
+      required:
+        - name
+        - email
+        - password
+        - organization
+        - languages
+
+    LoginOperatorBody:
+      type: object
+      properties:
+        email:
+          type: string
+        password:
+          type: string
+      required:
+        - email
+        - password
+
+    OperatorSession:
+      type: object
+      properties:
+        operatorId:
+          type: string
+        name:
+          type: string
+        email:
+          type: string
+        organization:
+          type: string
+        languages:
+          type: array
+          items:
+            type: string
+        token:
+          type: string
+        status:
+          type: string
+          enum: [available, busy, on_hold, offline]
+      required:
+        - operatorId
+        - name
+        - email
+        - organization
+        - languages
+        - token
+        - status
+
+    Operator:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        email:
+          type: string
+        organization:
+          type: string
+        languages:
+          type: array
+          items:
+            type: string
+        status:
+          type: string
+          enum: [available, busy, on_hold, offline]
+        activeCallId:
+          type: string
+          nullable: true
+        callsHandled:
+          type: integer
+        avgCallDuration:
+          type: number
+        createdAt:
+          type: string
+      required:
+        - id
+        - name
+        - email
+        - organization
+        - languages
+        - status
+        - callsHandled
+        - avgCallDuration
+        - createdAt
+
+    UpdateOperatorStatusBody:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [available, busy, on_hold, offline]
+      required:
+        - status
+
+    Call:
+      type: object
+      properties:
+        id:
+          type: string
+        callerId:
+          type: string
+        callerName:
+          type: string
+        operatorId:
+          type: string
+          nullable: true
+        operatorName:
+          type: string
+          nullable: true
+        state:
+          type: string
+          enum: [waiting, caller_connected, active, on_hold, dispatching, closing, ended]
+        language:
+          type: string
+        riskLevel:
+          type: string
+          enum: [low, medium, high, critical]
+          nullable: true
+        riskScore:
+          type: number
+          nullable: true
+        duration:
+          type: integer
+          nullable: true
+        startedAt:
+          type: string
+          nullable: true
+        endedAt:
+          type: string
+          nullable: true
+        createdAt:
+          type: string
+        location:
+          type: string
+          nullable: true
+        aiDisclosed:
+          type: boolean
+      required:
+        - id
+        - callerId
+        - callerName
+        - state
+        - language
+        - createdAt
+        - aiDisclosed
+
+    CreateCallBody:
+      type: object
+      properties:
+        callerId:
+          type: string
+        callerName:
+          type: string
+        language:
+          type: string
+        location:
+          type: string
+      required:
+        - callerId
+        - callerName
+        - language
+
+    UpdateCallStateBody:
+      type: object
+      properties:
+        state:
+          type: string
+          enum: [waiting, caller_connected, active, on_hold, dispatching, closing, ended]
+        operatorId:
+          type: string
+      required:
+        - state
+
+    AssignOperatorBody:
+      type: object
+      properties:
+        operatorId:
+          type: string
+      required:
+        - operatorId
+
+    TranscriptSegment:
+      type: object
+      properties:
+        id:
+          type: string
+        callId:
+          type: string
+        speaker:
+          type: string
+          enum: [caller, operator]
+        text:
+          type: string
+        language:
+          type: string
+        confidence:
+          type: number
+        timestamp:
+          type: string
+        isCodeSwitch:
+          type: boolean
+      required:
+        - id
+        - callId
+        - speaker
+        - text
+        - language
+        - confidence
+        - timestamp
+        - isCodeSwitch
+
+    AddTranscriptSegmentBody:
+      type: object
+      properties:
+        speaker:
+          type: string
+          enum: [caller, operator]
+        text:
+          type: string
+        language:
+          type: string
+        confidence:
+          type: number
+        isCodeSwitch:
+          type: boolean
+      required:
+        - speaker
+        - text
+        - language
+        - confidence
+        - isCodeSwitch
+
+    CallInsights:
+      type: object
+      properties:
+        callId:
+          type: string
+        riskLevel:
+          type: string
+          enum: [low, medium, high, critical]
+        riskScore:
+          type: number
+        emotionState:
+          type: string
+        distressIntensity:
+          type: number
+        cognitiveCoherence:
+          type: number
+        agitationLevel:
+          type: number
+        suicidalIdeationFlag:
+          type: boolean
+        ambientSounds:
+          type: array
+          items:
+            type: string
+        detectedLanguage:
+          type: string
+        codeSwitchCount:
+          type: integer
+        recommendedAction:
+          type: string
+        reasoningChain:
+          type: string
+        confidence:
+          type: number
+        uncertaintyFlags:
+          type: array
+          items:
+            type: string
+        operatorFatigueScore:
+          type: number
+        updatedAt:
+          type: string
+      required:
+        - callId
+        - riskLevel
+        - riskScore
+        - emotionState
+        - distressIntensity
+        - cognitiveCoherence
+        - agitationLevel
+        - suicidalIdeationFlag
+        - ambientSounds
+        - detectedLanguage
+        - codeSwitchCount
+        - recommendedAction
+        - reasoningChain
+        - confidence
+        - uncertaintyFlags
+        - operatorFatigueScore
+        - updatedAt
+
+    UpdateInsightsBody:
+      type: object
+      properties:
+        riskLevel:
+          type: string
+          enum: [low, medium, high, critical]
+        riskScore:
+          type: number
+        emotionState:
+          type: string
+        distressIntensity:
+          type: number
+        recommendedAction:
+          type: string
+        reasoningChain:
+          type: string
+        confidence:
+          type: number
+      required:
+        - riskLevel
+        - riskScore
+        - emotionState
+        - distressIntensity
+        - recommendedAction
+        - reasoningChain
+        - confidence
+
+    Resource:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        type:
+          type: string
+          enum: [hospital, clinic, pharmacy, police, counseling, shelter]
+        address:
+          type: string
+        phone:
+          type: string
+          nullable: true
+        distance:
+          type: number
+        isOpen24h:
+          type: boolean
+        lat:
+          type: number
+        lng:
+          type: number
+      required:
+        - id
+        - name
+        - type
+        - address
+        - distance
+        - isOpen24h
+        - lat
+        - lng
+
+    QueueStatus:
+      type: object
+      properties:
+        waitingCount:
+          type: integer
+        activeCount:
+          type: integer
+        onHoldCount:
+          type: integer
+        availableOperators:
+          type: integer
+        calls:
+          type: array
+          items:
+            $ref: "#/components/schemas/Call"
+      required:
+        - waitingCount
+        - activeCount
+        - onHoldCount
+        - availableOperators
+        - calls
+
+    DashboardInsights:
+      type: object
+      properties:
+        totalCallsToday:
+          type: integer
+        avgRiskLevel:
+          type: string
+        avgCallDuration:
+          type: number
+        languageBreakdown:
+          type: object
+          additionalProperties:
+            type: integer
+        riskBreakdown:
+          type: object
+          additionalProperties:
+            type: integer
+        activeOperators:
+          type: integer
+        totalOperators:
+          type: integer
+        callsPerHour:
+          type: array
+          items:
+            type: object
+            properties:
+              hour:
+                type: integer
+              count:
+                type: integer
+            required:
+              - hour
+              - count
+        topRecommendedActions:
+          type: array
+          items:
+            type: object
+            properties:
+              action:
+                type: string
+              count:
+                type: integer
+            required:
+              - action
+              - count
+      required:
+        - totalCallsToday
+        - avgRiskLevel
+        - avgCallDuration
+        - languageBreakdown
+        - riskBreakdown
+        - activeOperators
+        - totalOperators
+        - callsPerHour
+        - topRecommendedActions

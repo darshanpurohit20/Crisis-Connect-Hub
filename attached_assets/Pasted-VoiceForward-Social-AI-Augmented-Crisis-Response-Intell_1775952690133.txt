@@ -1,0 +1,91 @@
+VoiceForward - Social
+AI-Augmented Crisis Response Intelligence
+"Building a system that is technically impressive is easy. Building one that
+a trained human operator will actually trust during the most high-stakes
+moments of their professional lives that is the problem this challenge asks
+you to solve.
+"
+Problem Overview
+Every one of India's 700+ registered mental health and crisis helplines operates
+the same way: a human picks up a phone, listens, and decides what to do alone,
+under enormous pressure, with no tools beyond their training and a list of referral
+numbers. Research consistently shows that call outcomes are shaped more by
+operator fatigue, language mismatch, and time of day than by the actual severity
+of the caller's situation.
+A caller in genuine crisis reaching an exhausted volunteer at 3am in an unfamiliar
+language is statistically less likely to be helped than the same caller at 2pm. This
+is not a resource problem. It is an intelligence distribution problem and it is
+solvable.
+The AI capabilities needed to solve this already exist: real-time multilingual
+transcription, emotional affect detection, ambient audio classification, and
+resource retrieval. Yet zero production helplines in India use them. The gap is not
+technical - it is integration, trust, ethics, and human-centred design under
+pressure.
+VoiceForward is a real-time AI intelligence layer for human crisis helpline
+operators. It is not a chatbot. It does not speak to callers. It never acts
+autonomously in any situation affecting a person's safety. The AI's job is to make
+human operators dramatically more capable, more consistent, and less alone.
+PROBLEM STATEMENT
+VoiceForward - Social
+Layer 1 : Real-Time Multimodal Call Understanding
+•Analyse caller emotional state continuously across multiple dimensions — not just 'sad' or
+'angry' , including distress intensity, cognitive coherence, agitation, dissociation markers,
+suicidal ideation indicators, and operator vicarious trauma or fatigue.
+•Classify ambient audio in parallel and incorporate it into the live risk model: a child crying in
+the background combined with questions about shelter options changes the risk profile
+entirely, even if the caller never says so directly.
+•Handle mid-sentence code-switching between Indian languages without context loss, detect
+covert distress signals or codewords by correlating speech content with tone and
+background audio, and maintain a live narrative model that flags when new disclosures
+materially change the risk picture.
+Layer 2 : Multi-Agent Conflict Resolution & Transparent Decision-Making
+•The system uses multiple specialised agents examining different dimensions (language,
+emotion, ambient audio, narrative). When they disagree — and they will — the system must
+resolve the conflict and present a clear plain-language explanation of its reasoning, not a
+black-box output.
+•Every recommendation must include its full reasoning chain. Example: 'I'm flagging HIGH
+risk because the caller used the phrase "I've decided" twice, their speaking pace dropped
+40%, and their tone sounds unusually calm — which can itself be a risk indicator.
+'
+•Calibrated uncertainty is mandatory and non-negotiable: when signals are contradictory, the
+system must say so explicitly and default to treating the call as higher risk, rather than
+projecting false confidence.
+Layer 3 : Operator Interface & Cognitive Load Design
+•The interface must be ambient-first — peripheral visual cues, never interrupting text blocks.
+Three types of information must always be visible without competing: immediate guidance
+(what to say right now), situational awareness (what the AI understands about this call), and
+resource readiness (pre-ranked, one-click action).
+•Operator interactions cannot disrupt the call — a single keyboard shortcut, glance-based
+input, or minimal gesture. When the system earns an interruption, it must be faster to read
+than to ignore.
+•Operators must be able to agree, modify, or reject any AI recommendation with a single
+action. The operator's voice, attention, and emotional presence must remain entirely with the
+caller at all times.
+PROBLEM STATEMENT
+VoiceForward - Social
+Layer 4 : Longitudinal Pattern Intelligence Across the Call Corpus
+•The system must learn from every call — identifying which operator phrases
+correlate with better outcomes, what call characteristics at minute 5 predict
+escalation at minute 20, and which resource referrals have high follow-through vs.
+drop-off rates.
+•Insights feed two downstream capabilities: continuous model improvement
+(escalation probability, resource rankings, operator guidance updated from
+observed outcomes) and a supervisor dashboard surfacing systemic trends,
+operator performance patterns, and resource gaps.
+•Privacy is a hard architectural constraint, not a policy statement: no personally
+identifiable caller information may persist beyond the session without explicit
+consent. Learning must happen from patterns, not from individuals — enforced
+structurally in the data architecture.
+Layer 5 : Ethical Architecture, Failure Modes & Accountability Design
+•Every AI recommendation must be logged immutably with full reasoning,
+confidence level, and the operator's response (accepted / modified / rejected). If
+a call ends in a harmful outcome, supervisors must be able to replay exactly what
+AI suggested, when, why, and what the operator did.
+•Each failure mode must have a specific designed response that degrades
+gracefully not just a generic error handler. Required cases: STT failure causing
+downstream agents to operate on false information, emotion model
+misclassification (high-risk caller rated low-risk), and resource dispatch error.
+•Callers must be informed within the first 30 seconds that AI is assisting the
+operator. Opt-out must not create a worse experience — it simply disables AI
+assistance mode. DPDPA 2023 compliance is not optional: data localisation, right
+to erasure, and MeitY AI governance alignment must be addressed substantively.

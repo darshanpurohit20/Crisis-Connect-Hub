@@ -1,0 +1,31 @@
+kind = "web"
+previewPath = "/"
+title = "VoiceForward"
+version = "1.0.0"
+id = "artifacts/voiceforward"
+router = "path"
+
+[[integratedSkills]]
+name = "react-vite"
+version = "1.0.0"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 22275
+
+[services.development]
+run = "pnpm --filter @workspace/voiceforward run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/voiceforward", "run", "build" ]
+publicDir = "artifacts/voiceforward/dist/public"
+serve = "static"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "22275"
+BASE_PATH = "/"

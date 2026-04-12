@@ -1,0 +1,2407 @@
+# VoiceForward — Complete Implementation Guide
+### AI-Augmented Crisis Response Intelligence · SOC1 Hackathon
+
+---
+
+## Table of Contents
+1. [System Overview](#1-system-overview)
+2. [Telephony Infrastructure — WebRTC Hybrid](#2-telephony-infrastructure)
+3. [Sarvam AI Integration — Multilingual STT/TTS](#3-sarvam-ai-integration)
+4. [Multi-Agent System — All 5 Agents + MetaAgent](#4-multi-agent-system)
+5. [Operator HUD — Three-Pane Layout](#5-operator-hud)
+6. [Map + Dispatch Panel](#6-map--dispatch-panel)
+7. [Backend Architecture](#7-backend-architecture)
+8. [Frontend Components](#8-frontend-components)
+9. [DPDPA 2023 Compliance](#9-dpdpa-2023-compliance)
+10. [Failure Mode Playbook](#10-failure-mode-playbook)
+11. [Hallucination Prevention — 7-Layer System](#11-hallucination-prevention)
+
+---
+
+## 1. System Overview
+
+### What VoiceForward IS vs. IS NOT
+
+| IS | IS NOT |
+|----|--------|
+| A real-time intelligence layer for human operators | A chatbot or autonomous agent |
+| An ambient HUD that surfaces AI cues without interrupting | A system that speaks to callers |
+| A multi-agent risk classifier with transparent reasoning | A black-box scorer |
+| A dispatch-ready resource map pre-loaded with caller location | A replacement for trained counsellors |
+
+### Full Data Flow — Audio to HUD in 8 Steps
+
+```
+STEP 1  Caller rings helpline number (browser WebRTC tab or SIM dial-in)
+          └─> WebRTC peer connection established, two MediaStream tracks captured
+                  caller_track  ──┐
+                  operator_track ─┴──> STEP 2
+
+STEP 2  FastAPI WebSocket /ws/call/{call_id}
+          └─> Raw PCM chunks (16kHz mono, 3-second windows, 1s overlap)
+              stored in Redis Streams keyed by call_id + speaker role
+                                        └──> STEP 3
+
+STEP 3  Sarvam AI Streaming STT (primary) / faster-whisper fallback
+          └─> Timestamped transcript segments with:
+              - speaker: "caller" | "operator"
+              - language: "hi" | "mr" | "ta" | "te" | "en" | "mixed"
+              - confidence: 0.0–1.0
+              - code_switch_point: true | false
+              Published to Redis channel: transcript:{call_id}
+                                        └──> STEP 4
+
+STEP 4  Five parallel agents subscribe to transcript + audio Redis channels
+          EmotionAgent     ──┐
+          AmbientAgent     ──┤
+          NarrativeAgent   ──┼──> STEP 5
+          LanguageAgent    ──┤
+          OperatorFatigue  ──┘
+
+STEP 5  MetaAgent conflict resolver (Groq llama-3.3-70b, free tier)
+          └─> Unified risk assessment JSON:
+              { risk_level, confidence, reasoning_chain, recommended_action,
+                dissenting_agents, uncertainty_flags }
+                                        └──> STEP 6
+
+STEP 6  HUD push via Server-Sent Events (SSE) to React frontend
+          └─> Risk gauge update (smooth interpolation, never jump)
+              Transcript panel update
+              Recommended action card
+              Resource panel re-rank
+                                        └──> STEP 7
+
+STEP 7  Location extraction from speech (NLP entity extraction)
+          └─> Geocode → Overpass API (free OpenStreetMap)
+              Query: hospitals + clinics + pharmacies + police within 5km
+              Results ranked by: distance + 24h open status + capacity signal
+                                        └──> STEP 8
+
+STEP 8  Operator one-click dispatch
+          └─> Resource selected → dispatch_request event fired
+              Confirmation modal (2-step: select → confirm)
+              Immutable audit log entry written
+              Caller notified: "Help has been arranged for you"
+```
+
+### Technology Stack — Free Tier Only
+
+| Layer | Tool | Why |
+|-------|------|-----|
+| Calling (demo) | WebRTC (browser native) | Zero cost, real-time, works in hackathon |
+| STT primary | Sarvam AI (`saarika:v2`) | Free tier, 22 Indian languages, streaming |
+| STT fallback | faster-whisper (local) | No API cost, GPU-optional |
+| Emotion model | SpeechBrain `wav2vec2` | HuggingFace free, runs CPU |
+| Ambient classification | YAMNet (TF Hub free) | 521 sound classes, fast |
+| LLM (agents) | Groq `llama-3.3-70b` | 30 req/min free, ~300ms latency |
+| LLM fallback | Ollama `llama3.2` (local) | When Groq rate-limits |
+| Maps | Leaflet.js + OpenStreetMap | Fully free |
+| Resource data | Overpass API (OSM) | Free, India coverage |
+| Backend | FastAPI + uvicorn | Python, async, Darshan-familiar |
+| Message bus | Redis Streams + Pub/Sub | Docker, free |
+| Database | PostgreSQL (Docker) | Free, structured |
+| Frontend | React + Tailwind CSS | Free, fast |
+| TTS (operator cues) | Sarvam AI `bulbul:v1` | Free tier, 10 Indian languages |
+
+---
+
+## 2. Telephony Infrastructure
+
+### Architecture Decision: WebRTC for Demo
+
+For the hackathon, both caller and operator open browser tabs. This eliminates telephony complexity while demonstrating the full AI pipeline in real-time. The architecture is designed so swapping in Twilio Media Streams later requires only changing the audio source adapter — zero changes to the AI pipeline.
+
+```
+CALLER BROWSER TAB                    OPERATOR BROWSER TAB
+┌─────────────────────┐               ┌─────────────────────┐
+│  /caller/{call_id}  │               │  /operator/{call_id}│
+│  getUserMedia()     │               │  getUserMedia()      │
+│  mic → AudioContext │               │  mic → AudioContext  │
+│  PCM chunks → WS    │               │  PCM chunks → WS     │
+└──────────┬──────────┘               └──────────┬──────────┘
+           │  WebSocket                           │  WebSocket
+           └──────────────┬───────────────────────┘
+                          │
+                 ┌────────▼────────┐
+                 │  FastAPI WS     │
+                 │  /ws/call/{id}  │
+                 │  ?role=caller   │
+                 │  ?role=operator │
+                 └────────┬────────┘
+                          │
+                   Redis Streams
+                   audio:{call_id}:caller
+                   audio:{call_id}:operator
+```
+
+### Call Lifecycle State Machine
+
+```python
+# backend/models/call_state.py
+
+from enum import Enum
+
+class CallState(Enum):
+    WAITING          = "waiting"           # Call ID created, no parties connected
+    CALLER_CONNECTED = "caller_connected"  # Caller joined, operator not yet
+    ACTIVE           = "active"            # Both parties, AI pipeline running
+    ON_HOLD          = "on_hold"           # Operator paused call
+    DISPATCHING      = "dispatching"       # Resource dispatch in progress
+    CLOSING          = "closing"           # Call ending, wrap-up
+    ENDED            = "ended"             # Call complete, session data persisted
+
+VALID_TRANSITIONS = {
+    CallState.WAITING:          [CallState.CALLER_CONNECTED],
+    CallState.CALLER_CONNECTED: [CallState.ACTIVE, CallState.ENDED],
+    CallState.ACTIVE:           [CallState.ON_HOLD, CallState.DISPATCHING, CallState.CLOSING],
+    CallState.ON_HOLD:          [CallState.ACTIVE, CallState.CLOSING],
+    CallState.DISPATCHING:      [CallState.ACTIVE, CallState.CLOSING],
+    CallState.CLOSING:          [CallState.ENDED],
+    CallState.ENDED:            []
+}
+```
+
+### WebRTC Audio Capture — Client Side (React)
+
+```javascript
+// frontend/src/hooks/useAudioStream.js
+
+export function useAudioStream(callId, role) {
+  const wsRef = useRef(null);
+  const processorRef = useRef(null);
+
+  useEffect(() => {
+    let stream;
+    const WS_URL = `ws://localhost:8000/ws/call/${callId}?role=${role}`;
+
+    async function startCapture() {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          sampleRate: 16000,
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        }
+      });
+
+      wsRef.current = new WebSocket(WS_URL);
+
+      await new Promise(r => wsRef.current.onopen = r);
+
+      const audioCtx = new AudioContext({ sampleRate: 16000 });
+      const source = audioCtx.createMediaStreamSource(stream);
+
+      // ScriptProcessor gives us raw PCM — 3072 samples ≈ 192ms chunks
+      const processor = audioCtx.createScriptProcessor(3072, 1, 1);
+      processorRef.current = processor;
+
+      processor.onaudioprocess = (e) => {
+        if (wsRef.current?.readyState !== WebSocket.OPEN) return;
+        const pcm = e.inputBuffer.getChannelData(0);
+        // Convert Float32 [-1,1] to Int16 PCM
+        const int16 = new Int16Array(pcm.length);
+        for (let i = 0; i < pcm.length; i++) {
+          int16[i] = Math.max(-32768, Math.min(32767, pcm[i] * 32768));
+        }
+        wsRef.current.send(int16.buffer);
+      };
+
+      source.connect(processor);
+      processor.connect(audioCtx.destination);
+    }
+
+    startCapture();
+
+    return () => {
+      processorRef.current?.disconnect();
+      wsRef.current?.close();
+      stream?.getTracks().forEach(t => t.stop());
+    };
+  }, [callId, role]);
+}
+```
+
+### WebSocket Audio Receiver — FastAPI Backend
+
+```python
+# backend/routers/websocket.py
+
+import asyncio
+import redis.asyncio as aioredis
+from fastapi import WebSocket, WebSocketDisconnect
+import numpy as np
+
+redis_client = aioredis.from_url("redis://localhost:6379")
+
+@app.websocket("/ws/call/{call_id}")
+async def audio_websocket(ws: WebSocket, call_id: str, role: str):
+    """
+    Receives raw Int16 PCM audio from caller or operator browser tab.
+    Buffers into 3-second chunks (48000 samples at 16kHz) with 1s overlap.
+    Publishes to Redis Stream for downstream STT pipeline.
+    """
+    await ws.accept()
+    
+    # Verify call exists and role is valid
+    call = await get_call(call_id)
+    if not call or role not in ("caller", "operator"):
+        await ws.close(code=1008)
+        return
+
+    await update_call_state(call_id, role, "connected")
+
+    buffer = bytearray()
+    CHUNK_BYTES  = 48000 * 2  # 3 seconds × 16kHz × 2 bytes/sample
+    OVERLAP_BYTES = 16000 * 2  # 1 second overlap
+
+    try:
+        while True:
+            data = await ws.receive_bytes()
+            buffer.extend(data)
+
+            while len(buffer) >= CHUNK_BYTES:
+                chunk = bytes(buffer[:CHUNK_BYTES])
+                
+                # Push to Redis Stream — STT workers consume from here
+                await redis_client.xadd(
+                    f"audio:{call_id}:{role}",
+                    {
+                        "pcm": chunk,
+                        "call_id": call_id,
+                        "role": role,
+                        "ts": str(asyncio.get_event_loop().time())
+                    },
+                    maxlen=50  # Keep last 50 chunks (~2.5 min rolling buffer)
+                )
+
+                # Slide window with 1s overlap for continuity
+                buffer = buffer[CHUNK_BYTES - OVERLAP_BYTES:]
+
+    except WebSocketDisconnect:
+        await update_call_state(call_id, role, "disconnected")
+        await handle_party_disconnect(call_id, role)
+```
+
+### AI Disclosure — 30-Second Timer (DPDPA Requirement)
+
+```javascript
+// frontend/src/components/AIDisclosureTimer.jsx
+// This component manages the mandatory 30-second AI disclosure countdown.
+// Operator sees: "AI disclosure pending — 18s remaining"
+// Caller hears TTS: "This call may be assisted by AI tools to help our counsellor..."
+
+export function AIDisclosureTimer({ callId, onDisclosed, onOptOut }) {
+  const [secondsLeft, setSecondsLeft] = useState(30);
+  const [status, setStatus] = useState("pending"); // pending | disclosed | opted_out
+
+  useEffect(() => {
+    // Auto-trigger TTS disclosure at call start
+    triggerDisclosureTTS(callId);
+
+    const interval = setInterval(() => {
+      setSecondsLeft(s => {
+        if (s <= 1) {
+          clearInterval(interval);
+          setStatus("disclosed");
+          onDisclosed();
+          return 0;
+        }
+        return s - 1;
+      });
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, []);
+
+  return (
+    <div className={`disclosure-banner ${status}`}>
+      {status === "pending" && (
+        <>
+          <span>AI disclosure in progress — {secondsLeft}s</span>
+          <button onClick={() => { setStatus("opted_out"); onOptOut(); }}>
+            Caller opt-out
+          </button>
+        </>
+      )}
+      {status === "opted_out" && (
+        <span className="opted-out">AI assistance disabled for this call</span>
+      )}
+    </div>
+  );
+}
+```
+
+---
+
+## 3. Sarvam AI Integration
+
+### Why Sarvam AI (Not Google/Azure)
+
+Sarvam AI is built specifically for Indian languages. `saarika:v2` handles 22 scheduled Indian languages natively, code-switching mid-sentence, and regional accents. It's the only production STT system trained on crisis/emotional Indian speech data. Free tier: 60 minutes/day, enough for demo.
+
+### Account Setup
+
+```bash
+# Sign up at: https://www.sarvam.ai/
+# Get API key from dashboard
+# Free tier: 60 min STT + 10k TTS chars/day
+
+pip install sarvamai
+```
+
+### Streaming STT Implementation
+
+```python
+# backend/services/stt_service.py
+
+import asyncio
+import httpx
+import json
+import numpy as np
+from dataclasses import dataclass
+from typing import AsyncGenerator
+
+SARVAM_API_KEY = "your_sarvam_api_key_here"  # Store in .env
+
+@dataclass
+class TranscriptSegment:
+    text: str
+    language: str           # "hi", "mr", "ta", "te", "en", "mixed"
+    confidence: float       # 0.0–1.0
+    speaker: str            # "caller" or "operator"
+    start_ms: int
+    end_ms: int
+    code_switch: bool       # True if language changed mid-segment
+    raw_words: list         # Word-level timestamps from Sarvam
+
+class SarvamSTTService:
+    """
+    Wraps Sarvam AI saarika:v2 for streaming transcription.
+    Falls back to faster-whisper if Sarvam quota exhausted or unreachable.
+    """
+
+    def __init__(self):
+        self.client = httpx.AsyncClient(timeout=10.0)
+        self.fallback = FasterWhisperFallback()  # see below
+        self.daily_seconds_used = 0
+        self.DAILY_LIMIT_SECONDS = 3600  # 60 min free tier
+
+    async def transcribe_chunk(
+        self,
+        pcm_bytes: bytes,
+        speaker: str,
+        hint_language: str = "unknown"
+    ) -> TranscriptSegment:
+        """
+        Transcribes a 3-second PCM chunk.
+        hint_language: pass last detected language for continuity.
+        """
+        if self.daily_seconds_used >= self.DAILY_LIMIT_SECONDS:
+            return await self.fallback.transcribe_chunk(pcm_bytes, speaker)
+
+        # Convert raw PCM to WAV bytes for API
+        wav_bytes = pcm_to_wav(pcm_bytes, sample_rate=16000)
+
+        try:
+            response = await self.client.post(
+                "https://api.sarvam.ai/speech-to-text",
+                headers={"api-subscription-key": SARVAM_API_KEY},
+                files={"file": ("audio.wav", wav_bytes, "audio/wav")},
+                data={
+                    "model": "saarika:v2",
+                    "language_code": hint_language if hint_language != "unknown" else "unknown",
+                    "with_timestamps": "true",
+                    "with_disfluencies": "false"  # Strip "um", "uh" for cleaner transcript
+                }
+            )
+            response.raise_for_status()
+            result = response.json()
+
+            self.daily_seconds_used += 3
+
+            # Detect code-switching: did language change from last segment?
+            detected_lang = result.get("language_code", "unknown")
+            code_switch = (hint_language != "unknown" and
+                          hint_language != detected_lang and
+                          detected_lang != "unknown")
+
+            return TranscriptSegment(
+                text=result["transcript"],
+                language=detected_lang,
+                confidence=result.get("confidence", 0.85),
+                speaker=speaker,
+                start_ms=result.get("start_time_ms", 0),
+                end_ms=result.get("end_time_ms", 3000),
+                code_switch=code_switch,
+                raw_words=result.get("words", [])
+            )
+
+        except (httpx.HTTPError, KeyError) as e:
+            # Sarvam unavailable — transparent fallback to local Whisper
+            print(f"[STT] Sarvam failed ({e}), falling back to Whisper")
+            return await self.fallback.transcribe_chunk(pcm_bytes, speaker)
+
+
+class FasterWhisperFallback:
+    """
+    Local Whisper via faster-whisper. No API cost. GPU optional.
+    Model: medium (best balance of speed vs Indian language accuracy).
+    Download: ~1.5GB first run, cached after.
+    """
+    def __init__(self):
+        from faster_whisper import WhisperModel
+        # device="cpu", compute_type="int8" runs on any laptop
+        self.model = WhisperModel("medium", device="cpu", compute_type="int8")
+
+    async def transcribe_chunk(self, pcm_bytes: bytes, speaker: str) -> TranscriptSegment:
+        # faster-whisper is synchronous — run in thread pool
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, self._sync_transcribe, pcm_bytes)
+        return TranscriptSegment(
+            text=result["text"],
+            language=result["language"],
+            confidence=result["confidence"],
+            speaker=speaker,
+            start_ms=0,
+            end_ms=3000,
+            code_switch=False,
+            raw_words=[]
+        )
+
+    def _sync_transcribe(self, pcm_bytes: bytes) -> dict:
+        audio = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        segments, info = self.model.transcribe(
+            audio,
+            beam_size=3,                       # Faster than default 5
+            language=None,                     # Auto-detect
+            condition_on_previous_text=True,   # Better context continuity
+            vad_filter=True                    # Skip silence chunks
+        )
+        text = " ".join(s.text for s in segments).strip()
+        return {
+            "text": text,
+            "language": info.language,
+            "confidence": info.language_probability
+        }
+
+
+def pcm_to_wav(pcm_bytes: bytes, sample_rate: int = 16000) -> bytes:
+    """Wraps raw PCM bytes in a minimal WAV header."""
+    import struct
+    num_samples = len(pcm_bytes) // 2
+    header = struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF", 36 + len(pcm_bytes), b"WAVE",
+        b"fmt ", 16, 1, 1, sample_rate,
+        sample_rate * 2, 2, 16,
+        b"data", len(pcm_bytes)
+    )
+    return header + pcm_bytes
+```
+
+### Code-Switch Handling
+
+```python
+# backend/services/language_tracker.py
+
+INDIAN_LANGUAGES = {
+    "hi": "Hindi",    "mr": "Marathi",  "ta": "Tamil",
+    "te": "Telugu",   "bn": "Bengali",  "gu": "Gujarati",
+    "kn": "Kannada",  "ml": "Malayalam","pa": "Punjabi",
+    "or": "Odia",     "en": "English"
+}
+
+class LanguageTracker:
+    """
+    Tracks language across segments. Handles code-switching without losing context.
+    Key insight: when someone code-switches, their emotional content often crosses
+    the language boundary — we must NOT reset context on language change.
+    """
+
+    def __init__(self):
+        self.segment_languages = []   # Rolling window of last 10 segment languages
+        self.primary_language = None  # Most frequent in this call
+        self.switch_count = 0
+
+    def update(self, segment: TranscriptSegment) -> dict:
+        self.segment_languages.append(segment.language)
+        if len(self.segment_languages) > 10:
+            self.segment_languages.pop(0)
+
+        # Primary = most common language across call
+        from collections import Counter
+        self.primary_language = Counter(self.segment_languages).most_common(1)[0][0]
+
+        if segment.code_switch:
+            self.switch_count += 1
+
+        return {
+            "primary_language": self.primary_language,
+            "current_language": segment.language,
+            "switch_count": self.switch_count,
+            "is_multilingual_call": self.switch_count > 2,
+            "language_name": INDIAN_LANGUAGES.get(segment.language, segment.language)
+        }
+```
+
+### TTS for Operator Cues (Sarvam bulbul:v1)
+
+```python
+# backend/services/tts_service.py
+# Used for: AI disclosure announcement, critical escalation audio cue to operator
+
+async def speak_to_caller(text: str, language: str = "hi-IN") -> bytes:
+    """
+    Converts text to speech for caller-facing announcements.
+    Used ONLY for: (1) AI disclosure, (2) hold music messages.
+    Never used to deliver AI-generated counselling content to caller.
+    """
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            "https://api.sarvam.ai/text-to-speech",
+            headers={"api-subscription-key": SARVAM_API_KEY},
+            json={
+                "inputs": [text],
+                "target_language_code": language,
+                "speaker": "meera",      # Warm, calm female voice
+                "pitch": 0,
+                "pace": 0.9,             # Slightly slower for clarity under stress
+                "loudness": 1.0,
+                "speech_sample_rate": 16000,
+                "model": "bulbul:v1"
+            }
+        )
+        result = response.json()
+        # Returns base64-encoded WAV
+        import base64
+        return base64.b64decode(result["audios"][0])
+
+AI_DISCLOSURE_TEXTS = {
+    "hi": "यह कॉल एक AI सहायक द्वारा सपोर्ट की जा सकती है जो हमारे काउंसलर की मदद करता है। आप किसी भी समय AI सहायता बंद कर सकते हैं।",
+    "mr": "या कॉलला AI सहाय्यक साहाय्य करत आहे जो आमच्या समुपदेशकाला मदत करतो। तुम्ही कधीही AI मदत बंद करू शकता.",
+    "ta": "இந்த அழைப்பில் AI உதவியாளர் எங்கள் ஆலோசகருக்கு உதவுகிறார். எப்போது வேண்டுமானாலும் AI உதவியை நிறுத்தலாம்.",
+    "en": "This call is assisted by an AI tool that helps our counsellor. You can disable AI assistance at any time."
+}
+```
+
+---
+
+## 4. Multi-Agent System
+
+### Architecture Overview
+
+```
+                    Redis channel: transcript:{call_id}
+                    Redis channel: audio:{call_id}:caller
+                           │
+              ┌────────────┴────────────┐
+              │                         │
+     ┌────────▼───────┐       ┌─────────▼──────┐
+     │  EmotionAgent  │       │  AmbientAgent  │
+     │  (audio input) │       │  (audio input) │
+     └────────┬───────┘       └─────────┬──────┘
+              │                         │
+     ┌────────▼───────┐       ┌─────────▼──────┐
+     │ NarrativeAgent │       │  LanguageAgent │
+     │(transcript in) │       │(transcript in) │
+     └────────┬───────┘       └─────────┬──────┘
+              │                         │
+              │              ┌──────────▼──────┐
+              │              │OperatorFatigue  │
+              │              │(operator audio) │
+              │              └──────────┬──────┘
+              └──────────┬──────────────┘
+                         │  All 5 agent outputs
+                ┌────────▼────────┐
+                │   MetaAgent     │
+                │ (Groq LLM call) │
+                └────────┬────────┘
+                         │
+                  HUD SSE push
+```
+
+### Agent 1 — EmotionAgent
+
+```python
+# backend/agents/emotion_agent.py
+
+import torch
+from transformers import pipeline
+
+class EmotionAgent:
+    """
+    Analyses caller's emotional state from raw audio.
+    Model: speechbrain/emotion-recognition-wav2vec2-IEMOCAP
+    Output: valence (-1 to +1), arousal (0 to 1), dominant emotion, distress score
+    
+    Key signals for crisis:
+    - Flat affect (low arousal + negative valence) = dissociation risk
+    - Very high arousal = panic/agitation
+    - Sudden calm after distress = "decision made" signal (HIGH RISK)
+    """
+
+    DISSOCIATION_THRESHOLD = 0.25   # arousal below this after high distress
+    PANIC_AROUSAL_THRESHOLD = 0.85
+
+    def __init__(self):
+        self.classifier = pipeline(
+            "audio-classification",
+            model="speechbrain/emotion-recognition-wav2vec2-IEMOCAP",
+            device=-1  # CPU
+        )
+        self.history = []   # Last 10 emotion readings for trend analysis
+
+    async def analyse(self, pcm_bytes: bytes, call_id: str) -> dict:
+        import asyncio
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, self._sync_analyse, pcm_bytes)
+
+        self.history.append(result)
+        if len(self.history) > 10:
+            self.history.pop(0)
+
+        # Detect "eerie calm" — sudden drop in arousal after high distress
+        eerie_calm = self._detect_eerie_calm()
+
+        return {
+            "agent": "emotion",
+            "dominant_emotion": result["label"],
+            "confidence": result["score"],
+            "distress_score": self._to_distress_score(result["label"], result["score"]),
+            "arousal_estimate": self._arousal_from_label(result["label"]),
+            "eerie_calm_flag": eerie_calm,
+            "trend": self._emotion_trend(),
+            "risk_contribution": self._compute_risk(result, eerie_calm)
+        }
+
+    def _sync_analyse(self, pcm_bytes: bytes) -> dict:
+        import numpy as np
+        audio = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        results = self.classifier(audio, sampling_rate=16000)
+        return results[0]  # Top prediction
+
+    def _detect_eerie_calm(self) -> bool:
+        if len(self.history) < 4:
+            return False
+        recent_arousals = [self._arousal_from_label(h["label"]) for h in self.history[-4:]]
+        # Was high arousal 2+ readings ago, now suddenly low?
+        was_high = any(a > 0.7 for a in recent_arousals[:2])
+        now_low  = recent_arousals[-1] < self.DISSOCIATION_THRESHOLD
+        return was_high and now_low
+
+    def _to_distress_score(self, label: str, confidence: float) -> float:
+        DISTRESS_MAP = {
+            "sad": 0.7, "fear": 0.9, "angry": 0.6,
+            "disgust": 0.5, "neutral": 0.2, "happy": 0.1
+        }
+        return DISTRESS_MAP.get(label.lower(), 0.3) * confidence
+
+    def _arousal_from_label(self, label: str) -> float:
+        AROUSAL_MAP = {
+            "fear": 0.9, "angry": 0.85, "happy": 0.7,
+            "sad": 0.35, "disgust": 0.6, "neutral": 0.4
+        }
+        return AROUSAL_MAP.get(label.lower(), 0.5)
+
+    def _emotion_trend(self) -> str:
+        if len(self.history) < 3:
+            return "insufficient_data"
+        scores = [self._to_distress_score(h["label"], h["score"]) for h in self.history[-3:]]
+        if scores[-1] > scores[0] + 0.2:   return "escalating"
+        if scores[-1] < scores[0] - 0.2:   return "de-escalating"
+        return "stable"
+
+    def _compute_risk(self, result: dict, eerie_calm: bool) -> str:
+        distress = self._to_distress_score(result["label"], result["score"])
+        if eerie_calm:              return "CRITICAL"
+        if distress > 0.8:         return "HIGH"
+        if distress > 0.5:         return "MEDIUM"
+        return "LOW"
+```
+
+### Agent 2 — AmbientAgent
+
+```python
+# backend/agents/ambient_agent.py
+
+import tensorflow as tf
+import tensorflow_hub as hub
+import numpy as np
+
+# HIGH_RISK_CLASSES: sounds that materially change crisis risk profile
+HIGH_RISK_SOUNDS = {
+    "crying":           0.9,   # Child crying = possible domestic crisis
+    "screaming":        0.95,
+    "gunshot_gunfire":  1.0,
+    "glass_breaking":   0.8,
+    "dog_barking":      0.2,
+    "traffic_noise":    0.1,   # Could indicate caller is outdoors/unsafe
+    "music":            0.05,
+    "siren":            0.7,   # Emergency vehicle already responding?
+    "crowd":            0.3,
+}
+
+class AmbientAgent:
+    """
+    Classifies background sounds using YAMNet (521 classes).
+    Key insight: background audio is independent evidence — a child crying
+    behind a 'routine' call changes the risk picture entirely.
+    """
+
+    def __init__(self):
+        self.model = hub.load("https://tfhub.dev/google/yamnet/1")
+        self.class_names = self._load_class_names()
+
+    def _load_class_names(self):
+        import csv, io, urllib.request
+        url = "https://raw.githubusercontent.com/tensorflow/models/master/research/audioset/yamnet/yamnet_class_map.csv"
+        data = urllib.request.urlopen(url).read().decode()
+        reader = csv.DictReader(io.StringIO(data))
+        return [r["display_name"] for r in reader]
+
+    async def analyse(self, pcm_bytes: bytes) -> dict:
+        import asyncio
+        return await asyncio.get_event_loop().run_in_executor(
+            None, self._sync_analyse, pcm_bytes
+        )
+
+    def _sync_analyse(self, pcm_bytes: bytes) -> dict:
+        audio = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        scores, embeddings, log_mel = self.model(audio)
+        mean_scores = tf.reduce_mean(scores, axis=0).numpy()
+
+        top_5_idx = mean_scores.argsort()[-5:][::-1]
+        top_sounds = [
+            {"sound": self.class_names[i], "confidence": float(mean_scores[i])}
+            for i in top_5_idx if mean_scores[i] > 0.1
+        ]
+
+        # Compute ambient risk contribution
+        risk_score = 0.0
+        risk_sounds = []
+        for item in top_sounds:
+            sound_key = item["sound"].lower().replace(" ", "_")
+            if sound_key in HIGH_RISK_SOUNDS:
+                contribution = HIGH_RISK_SOUNDS[sound_key] * item["confidence"]
+                risk_score = max(risk_score, contribution)
+                risk_sounds.append(item["sound"])
+
+        return {
+            "agent": "ambient",
+            "top_sounds": top_sounds,
+            "risk_sounds_detected": risk_sounds,
+            "ambient_risk_score": risk_score,
+            "risk_contribution": "HIGH" if risk_score > 0.7 else "MEDIUM" if risk_score > 0.4 else "LOW",
+            "context_note": self._generate_context_note(risk_sounds)
+        }
+
+    def _generate_context_note(self, risk_sounds: list) -> str:
+        if "crying" in [s.lower() for s in risk_sounds]:
+            return "Child sounds detected — possible domestic crisis. Ask about children present."
+        if "screaming" in [s.lower() for s in risk_sounds]:
+            return "Screaming detected in background — possible ongoing distress."
+        if "siren" in [s.lower() for s in risk_sounds]:
+            return "Emergency vehicle sound detected."
+        return ""
+```
+
+### Agent 3 — NarrativeAgent
+
+```python
+# backend/agents/narrative_agent.py
+
+CRISIS_PHRASES = {
+    "finality": ["decided", "made up my mind", "last time", "goodbye", "won't see you",
+                 "everyone will be better", "no point", "can't take it anymore",
+                 # Hindi
+                 "faisla kar liya", "ab nahi", "alvida",
+                 # Marathi
+                 "nirnay ghetle", "shevat"],
+    "method":   ["pills", "rope", "knife", "building", "bridge", "jump",
+                 "goli", "chhat", "pul"],
+    "timeline": ["tonight", "today", "now", "soon", "this evening",
+                 "aaj raat", "abhi"]
+}
+
+class NarrativeAgent:
+    """
+    Builds a semantic model of the call's narrative arc.
+    Tracks: new disclosures, risk phrase detection, topic shifts, coherence.
+    Uses Groq for semantic understanding — not just keyword matching.
+    """
+
+    def __init__(self, groq_client):
+        self.groq = groq_client
+        self.narrative_context = []  # Rolling 10-segment context
+        self.risk_phrases_heard = []
+
+    async def analyse(self, segment, call_id: str) -> dict:
+        # Layer 1: Fast keyword check (zero latency)
+        keyword_flags = self._keyword_check(segment.text)
+
+        # Layer 2: Semantic analysis via Groq (only when needed)
+        semantic_result = await self._semantic_analyse(segment)
+
+        self.narrative_context.append({
+            "text": segment.text,
+            "language": segment.language,
+            "speaker": segment.speaker
+        })
+        if len(self.narrative_context) > 10:
+            self.narrative_context.pop(0)
+
+        return {
+            "agent": "narrative",
+            "keyword_flags": keyword_flags,
+            "semantic_risk": semantic_result["risk_level"],
+            "new_disclosure": semantic_result["new_disclosure"],
+            "coherence_score": semantic_result["coherence"],
+            "risk_phrases": self.risk_phrases_heard[-5:],
+            "risk_contribution": semantic_result["risk_level"],
+            "reasoning": semantic_result["reasoning"]
+        }
+
+    def _keyword_check(self, text: str) -> dict:
+        text_lower = text.lower()
+        found = {category: [] for category in CRISIS_PHRASES}
+        for category, phrases in CRISIS_PHRASES.items():
+            for phrase in phrases:
+                if phrase in text_lower:
+                    found[category].append(phrase)
+                    self.risk_phrases_heard.append(phrase)
+        return found
+
+    async def _semantic_analyse(self, segment) -> dict:
+        context_text = "\n".join(
+            f"[{s['speaker'].upper()}] {s['text']}"
+            for s in self.narrative_context[-5:]
+        )
+
+        prompt = f"""You are analysing a crisis helpline call. 
+Current speaker: {segment.speaker}
+Recent conversation:
+{context_text}
+
+Latest segment: "{segment.text}"
+
+Respond in JSON only. Fields:
+- risk_level: "LOW" | "MEDIUM" | "HIGH" | "CRITICAL"
+- new_disclosure: true/false (did caller reveal something materially new?)
+- coherence: 0.0-1.0 (is caller's speech coherent and organised?)
+- reasoning: one sentence explaining risk assessment
+- suicidal_ideation_detected: true/false"""
+
+        response = await self.groq.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=200,
+            response_format={"type": "json_object"}
+        )
+        import json
+        return json.loads(response.choices[0].message.content)
+```
+
+### Agent 4 — LanguageAgent
+
+```python
+# backend/agents/language_agent.py
+
+class LanguageAgent:
+    """
+    Tracks code-switching, detects distress signals specific to each language,
+    and flags when operator and caller are mismatched in language.
+    """
+
+    DISTRESS_CODEWORDS = {
+        # These phrases sound innocuous but are documented crisis signals
+        "hi": ["neend nahi aati", "bahut thak gaya", "koi nahi samjhega"],
+        "mr": ["kuni nahi samjhar", "aata nahi honar"],
+        "ta": ["yaarum puriyamaatdaanga", "tikka illai"],
+        "en": ["I'm fine", "don't worry about me", "just tired"]
+    }
+
+    async def analyse(self, segment, language_tracker) -> dict:
+        lang_state = language_tracker.update(segment)
+
+        # Check for coded distress in current language
+        codewords_found = []
+        lang = segment.language
+        if lang in self.DISTRESS_CODEWORDS:
+            for codeword in self.DISTRESS_CODEWORDS[lang]:
+                if codeword.lower() in segment.text.lower():
+                    codewords_found.append(codeword)
+
+        return {
+            "agent": "language",
+            "current_language": lang_state["current_language"],
+            "primary_language": lang_state["primary_language"],
+            "is_multilingual_call": lang_state["is_multilingual_call"],
+            "code_switch_detected": segment.code_switch,
+            "codewords_found": codewords_found,
+            "operator_language_match": True,  # Set by comparing with operator profile
+            "risk_contribution": "HIGH" if codewords_found else "LOW",
+            "operator_suggestion": (
+                f"Caller switched to {lang_state['current_language']} — respond in same language"
+                if segment.code_switch else None
+            )
+        }
+```
+
+### Agent 5 — OperatorFatigueAgent
+
+```python
+# backend/agents/operator_fatigue_agent.py
+
+class OperatorFatigueAgent:
+    """
+    Monitors operator's vocal and behavioural signals for fatigue and
+    vicarious trauma — because a fatigued operator misses cues.
+    Analyses: operator audio track only. Flags supervisor if fatigue detected.
+    """
+
+    def __init__(self):
+        self.operator_speaking_rate_history = []
+        self.response_latency_history = []   # ms between caller stop and operator start
+        self.session_call_count = 0
+
+    async def analyse(self, operator_pcm: bytes, response_latency_ms: int) -> dict:
+        import librosa, numpy as np
+        audio = np.frombuffer(operator_pcm, dtype=np.int16).astype(np.float32) / 32768.0
+
+        # Speaking rate: syllables per second (proxy via zero-crossing rate)
+        zcr = librosa.feature.zero_crossing_rate(audio)[0].mean()
+        energy = np.sqrt(np.mean(audio**2))
+
+        self.operator_speaking_rate_history.append(float(zcr))
+        self.response_latency_history.append(response_latency_ms)
+
+        if len(self.operator_speaking_rate_history) > 20:
+            self.operator_speaking_rate_history.pop(0)
+        if len(self.response_latency_history) > 20:
+            self.response_latency_history.pop(0)
+
+        fatigue_score = self._compute_fatigue_score(zcr, energy, response_latency_ms)
+
+        return {
+            "agent": "operator_fatigue",
+            "fatigue_score": fatigue_score,
+            "avg_response_latency_ms": int(np.mean(self.response_latency_history)),
+            "energy_level": float(energy),
+            "fatigue_flag": fatigue_score > 0.7,
+            "risk_contribution": "LOW",  # Fatigue is meta-risk, not direct caller risk
+            "supervisor_alert": fatigue_score > 0.85
+        }
+
+    def _compute_fatigue_score(self, zcr, energy, latency_ms) -> float:
+        score = 0.0
+        if zcr < 0.02:              score += 0.3   # Very low speech activity
+        if energy < 0.005:          score += 0.2   # Quiet/flat voice
+        if latency_ms > 4000:       score += 0.3   # Slow to respond
+        if self.session_call_count > 8: score += 0.2  # Many calls this shift
+        return min(score, 1.0)
+```
+
+### MetaAgent — Conflict Resolution Algorithm
+
+```python
+# backend/agents/meta_agent.py
+
+RISK_ORDER = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
+
+class MetaAgent:
+    """
+    Receives outputs from all 5 agents. Resolves conflicts. Produces a single
+    unified assessment with full reasoning chain.
+    
+    Conflict resolution principle: when agents disagree, default to HIGHER risk.
+    Calibrated uncertainty is mandatory — never project false confidence.
+    """
+
+    def __init__(self, groq_client):
+        self.groq = groq_client
+
+    async def resolve(self, agent_outputs: list, call_context: dict) -> dict:
+        # Step 1: Extract risk votes from each agent
+        votes = {
+            o["agent"]: o.get("risk_contribution", "LOW")
+            for o in agent_outputs
+        }
+
+        # Step 2: Find dissent — agents that disagree with the majority
+        from collections import Counter
+        vote_counts = Counter(votes.values())
+        majority_risk = vote_counts.most_common(1)[0][0]
+        dissenters = [agent for agent, vote in votes.items() if vote != majority_risk]
+
+        # Step 3: Conflict resolution rule — take the MAX risk (conservative)
+        max_risk = max(votes.values(), key=lambda r: RISK_ORDER[r])
+
+        # Step 4: Check for CRITICAL override conditions
+        critical_override = self._check_critical_overrides(agent_outputs)
+        if critical_override:
+            max_risk = "CRITICAL"
+
+        # Step 5: Generate plain-language reasoning chain via LLM
+        reasoning = await self._generate_reasoning(
+            agent_outputs, votes, max_risk, call_context
+        )
+
+        # Step 6: Compute confidence — lower when agents strongly disagree
+        agreement_ratio = vote_counts.most_common(1)[0][1] / len(votes)
+        confidence = agreement_ratio * 0.8 + 0.2  # Floor at 0.2
+
+        return {
+            "risk_level": max_risk,
+            "confidence": round(confidence, 2),
+            "reasoning_chain": reasoning["explanation"],
+            "recommended_action": reasoning["action"],
+            "agent_votes": votes,
+            "dissenting_agents": dissenters,
+            "uncertainty_flags": reasoning.get("uncertainty_flags", []),
+            "critical_override": critical_override,
+            "timestamp": asyncio.get_event_loop().time()
+        }
+
+    def _check_critical_overrides(self, agent_outputs: list) -> str | None:
+        """
+        Certain combinations always trigger CRITICAL regardless of vote count.
+        These are evidence-based triggers, not heuristics.
+        """
+        emotion  = next((o for o in agent_outputs if o["agent"] == "emotion"), {})
+        ambient  = next((o for o in agent_outputs if o["agent"] == "ambient"), {})
+        narrative= next((o for o in agent_outputs if o["agent"] == "narrative"), {})
+
+        if emotion.get("eerie_calm_flag"):
+            return "Sudden calm after sustained distress — high-risk indicator"
+
+        if narrative.get("keyword_flags", {}).get("finality") and \
+           narrative.get("keyword_flags", {}).get("method"):
+            return "Finality phrases + method reference detected simultaneously"
+
+        if ambient.get("risk_sounds_detected") and \
+           "crying" in [s.lower() for s in ambient.get("risk_sounds_detected", [])]:
+            if emotion.get("risk_contribution") in ("HIGH", "CRITICAL"):
+                return "Child distress sounds + caller high risk"
+
+        return None
+
+    async def _generate_reasoning(self, outputs, votes, final_risk, context) -> dict:
+        summary = "\n".join(
+            f"- {o['agent']}: {o.get('risk_contribution','?')} — "
+            f"{o.get('reasoning', o.get('context_note', o.get('operator_suggestion', 'no note')))}"
+            for o in outputs
+        )
+
+        prompt = f"""You are the reasoning engine for a crisis helpline AI system.
+Agent votes: {votes}
+Final risk level: {final_risk}
+Agent summaries:
+{summary}
+
+Write a 1-2 sentence plain English explanation of WHY this risk level was assigned.
+Then write a 1-sentence recommended action for the operator.
+Respond in JSON: {{explanation, action, uncertainty_flags: []}}"""
+
+        resp = await self.groq.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=300,
+            response_format={"type": "json_object"}
+        )
+        import json
+        return json.loads(resp.choices[0].message.content)
+```
+
+---
+
+## 5. Operator HUD
+
+### Three-Pane Layout Specification
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  VOICEFORWARD  │  Call #4821 · 08:32  │  [AI ✓]  [Fatigue 🔶]  │  ← TOP BAR
+├──────────────┬─────────────────────────┬───────────────────────┤
+│              │                         │                       │
+│  LEFT PANE   │    CENTER PANE          │   RIGHT PANE          │
+│  (20%)       │    (50%)                │   (30%)               │
+│              │                         │                       │
+│  RISK GAUGE  │  LIVE TRANSCRIPT        │  AI RECOMMENDATION    │
+│              │  (auto-scroll, speaker  │  ┌───────────────┐   │
+│   ●●●●○      │  colour-coded, lang tag)│  │ ⚠ HIGH RISK  │   │
+│   HIGH       │                         │  │               │   │
+│              │  [caller] मैंने तय कर  │  │ "I'm flagging │   │
+│  TREND: ↑    │  लिया है... (hi)        │  │ HIGH because  │   │
+│              │  [operator] Kya hua?    │  │ caller said   │   │
+│  AMBIENT:    │  [caller] कोई नही...   │  │ 'decided'     │   │
+│  🔇 Quiet    │                         │  │ twice, pace   │   │
+│              │  ─────────────────────  │  │ dropped 40%"  │   │
+│  FATIGUE:    │  REASONING (collapsed)  │  └───────────────┘   │
+│  Moderate    │  > I'm flagging HIGH    │                       │
+│              │    because...           │  [A] Accept           │
+│  CALLS       │                         │  [M] Modify           │
+│  TODAY: 6    │                         │  [R] Reject           │
+│              │                         │                       │
+│              │                         │  ─────────────────── │
+│              │                         │  RESOURCES (ranked)   │
+│              │                         │  📍 Apollo Clinic 1.2k│
+│              │                         │  📍 Police 2.1km      │
+│              │                         │  📍 iCall helpline    │
+└──────────────┴─────────────────────────┴───────────────────────┘
+```
+
+### Risk Gauge — Smooth Non-Jumping Updates
+
+```javascript
+// frontend/src/components/RiskGauge.jsx
+// CRITICAL: The gauge must NEVER jump. It smoothly interpolates.
+// A sudden jump would cause the operator to look away from the caller.
+
+const RISK_NUMERIC = { LOW: 0.2, MEDIUM: 0.5, HIGH: 0.75, CRITICAL: 1.0 };
+
+export function RiskGauge({ riskLevel, confidence, trend }) {
+  const [displayValue, setDisplayValue] = useState(0.2);
+  const targetRef = useRef(0.2);
+  const animRef = useRef(null);
+
+  useEffect(() => {
+    targetRef.current = RISK_NUMERIC[riskLevel] ?? 0.2;
+  }, [riskLevel]);
+
+  useEffect(() => {
+    const animate = () => {
+      setDisplayValue(prev => {
+        const diff = targetRef.current - prev;
+        // Lerp toward target — never jump more than 2% per frame
+        const next = prev + diff * 0.04;
+        return Math.abs(diff) < 0.001 ? targetRef.current : next;
+      });
+      animRef.current = requestAnimationFrame(animate);
+    };
+    animRef.current = requestAnimationFrame(animate);
+    return () => cancelAnimationFrame(animRef.current);
+  }, []);
+
+  const color = displayValue > 0.7 ? "#EF4444"
+               : displayValue > 0.45 ? "#F59E0B"
+               : "#10B981";
+
+  return (
+    <div className="risk-gauge">
+      <svg width="120" height="120" viewBox="0 0 120 120">
+        {/* Background arc */}
+        <path d="M 20 100 A 50 50 0 1 1 100 100" fill="none"
+              stroke="#E5E7EB" strokeWidth="12" strokeLinecap="round"/>
+        {/* Fill arc — dashoffset drives the fill level */}
+        <path d="M 20 100 A 50 50 0 1 1 100 100" fill="none"
+              stroke={color} strokeWidth="12" strokeLinecap="round"
+              strokeDasharray="188"
+              strokeDashoffset={188 - (displayValue * 188)}
+              style={{ transition: "stroke 0.5s" }}/>
+        <text x="60" y="90" textAnchor="middle" fontSize="14" fontWeight="bold"
+              fill={color}>{riskLevel}</text>
+      </svg>
+      <div className="trend-arrow" style={{ color }}>
+        {trend === "escalating" ? "↑" : trend === "de-escalating" ? "↓" : "→"}
+      </div>
+      <div className="confidence-bar">
+        <div style={{ width: `${confidence * 100}%`, background: color }}/>
+      </div>
+    </div>
+  );
+}
+```
+
+### Keyboard Shortcuts — Never Disrupt Call
+
+```javascript
+// frontend/src/hooks/useHUDKeyboard.js
+// Operator can accept/modify/reject without taking eyes off caller
+
+export function useHUDKeyboard({ onAccept, onModify, onReject, onEscalate }) {
+  useEffect(() => {
+    const handler = (e) => {
+      // Only fire if focus is NOT in an input/textarea
+      if (["INPUT","TEXTAREA"].includes(document.activeElement.tagName)) return;
+
+      switch(e.key.toLowerCase()) {
+        case "a": onAccept();   break;  // Accept AI recommendation
+        case "m": onModify();   break;  // Open modification panel
+        case "r": onReject();   break;  // Reject, log reason
+        case "e": onEscalate(); break;  // Escalate to supervisor
+        case "?": showShortcutHelp(); break;
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [onAccept, onModify, onReject, onEscalate]);
+}
+```
+
+---
+
+## 6. Map + Dispatch Panel
+
+### Overview
+
+The map panel shows resources within 5km of the caller's detected location. Location is extracted from speech in real-time (NLP), then geocoded. Resources are fetched from OpenStreetMap's Overpass API (completely free, no API key needed). The operator sees: hospitals, clinics, pharmacies, police stations, and shelters — all with distance, hours, and a one-click dispatch button.
+
+### Location Detection from Speech
+
+```python
+# backend/services/location_extractor.py
+
+import re
+import httpx
+from groq import AsyncGroq
+
+groq = AsyncGroq(api_key="your_groq_api_key")
+
+INDIA_LOCATION_PATTERNS = [
+    # Street/area patterns
+    r'\b(near|opposite|behind|beside|at)\s+([A-Z][a-zA-Z\s]{2,30})',
+    # PIN codes
+    r'\b[1-9][0-9]{5}\b',
+    # Common Mumbai/Delhi area suffixes
+    r'\b\w+\s*(nagar|colony|chowk|marg|road|lane|gali|bazar|bazaar)\b',
+]
+
+async def extract_location_from_transcript(
+    transcript_window: list[str],
+    city_hint: str = "Mumbai"
+) -> dict | None:
+    """
+    Extracts location mentions from the last 5 transcript segments.
+    Uses Groq for semantic extraction — handles "near the big temple",
+    "Dharavi junction", "100 feet road", etc.
+    Returns geocoded coordinates or None.
+    """
+    combined_text = " | ".join(transcript_window[-5:])
+
+    # Fast regex check first — avoid LLM call if no location words present
+    location_words = ["near", "at", "nagar", "colony", "road", "chowk",
+                      "PIN", "post office", "station", "hospital", "paas",
+                      "ke paas", "jawal", "colony", "building"]
+    if not any(w.lower() in combined_text.lower() for w in location_words):
+        return None
+
+    # LLM extraction
+    response = await groq.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{
+            "role": "user",
+            "content": f"""Extract any location mentioned in this crisis helpline transcript.
+Text: "{combined_text}"
+City context: {city_hint}
+If a location is found, respond with JSON: {{location_text, confidence: 0-1}}
+If no location found, respond: {{location_text: null}}
+Be generous — "near the temple on main road" is a valid location."""
+        }],
+        max_tokens=100,
+        response_format={"type": "json_object"}
+    )
+    import json
+    result = json.loads(response.choices[0].message.content)
+
+    if not result.get("location_text"):
+        return None
+
+    # Geocode the extracted text
+    return await geocode_location(result["location_text"], city_hint)
+
+
+async def geocode_location(location_text: str, city: str) -> dict | None:
+    """
+    Uses Nominatim (free, OpenStreetMap geocoder) to convert location text
+    to lat/lon. No API key required. Rate limit: 1 req/sec.
+    """
+    query = f"{location_text}, {city}, India"
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={"q": query, "format": "json", "limit": 1, "countrycodes": "in"},
+            headers={"User-Agent": "VoiceForward-CrisisApp/1.0"}
+        )
+        results = response.json()
+        if not results:
+            return None
+        return {
+            "lat": float(results[0]["lat"]),
+            "lon": float(results[0]["lon"]),
+            "display_name": results[0]["display_name"],
+            "confidence": float(results[0].get("importance", 0.5))
+        }
+```
+
+### Overpass API — Fetch Nearby Resources
+
+```python
+# backend/services/resource_fetcher.py
+
+import httpx
+import math
+
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+
+RESOURCE_QUERIES = {
+    "hospital": '["amenity"="hospital"]',
+    "clinic":   '["amenity"="clinic"]',
+    "pharmacy": '["amenity"="pharmacy"]',
+    "police":   '["amenity"="police"]',
+    "shelter":  '["social_facility"~"shelter|refuge"]',
+    "mental_health": '["healthcare"="psychotherapist"]["healthcare"="psychiatrist"]'
+}
+
+async def fetch_nearby_resources(lat: float, lon: float, radius_m: int = 5000) -> list:
+    """
+    Queries OpenStreetMap Overpass API for all crisis-relevant resources
+    within radius_m of the caller's location.
+    Returns list of resources sorted by distance.
+    """
+    # Build combined Overpass query
+    union_parts = "\n".join(
+        f'  node{query}(around:{radius_m},{lat},{lon});'
+        f'\n  way{query}(around:{radius_m},{lat},{lon});'
+        for query in RESOURCE_QUERIES.values()
+    )
+    overpass_query = f"""
+[out:json][timeout:25];
+(
+{union_parts}
+);
+out body center;
+"""
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(OVERPASS_URL, data=overpass_query)
+        data = response.json()
+
+    resources = []
+    for element in data.get("elements", []):
+        tags = element.get("tags", {})
+        name = tags.get("name") or tags.get("name:en") or tags.get("name:hi")
+        if not name:
+            continue
+
+        # Get coordinates (nodes have lat/lon directly; ways have center)
+        elem_lat = element.get("lat") or element.get("center", {}).get("lat")
+        elem_lon = element.get("lon") or element.get("center", {}).get("lon")
+        if not elem_lat or not elem_lon:
+            continue
+
+        distance_m = haversine_distance(lat, lon, elem_lat, elem_lon)
+        resource_type = classify_resource(tags)
+
+        resources.append({
+            "id": element["id"],
+            "name": name,
+            "type": resource_type,
+            "lat": elem_lat,
+            "lon": elem_lon,
+            "distance_m": int(distance_m),
+            "distance_display": format_distance(distance_m),
+            "phone": tags.get("phone") or tags.get("contact:phone"),
+            "opening_hours": tags.get("opening_hours", "Unknown"),
+            "is_24h": "24/7" in tags.get("opening_hours", "") or
+                      "24h" in tags.get("opening_hours", ""),
+            "address": build_address(tags),
+            "google_maps_url": f"https://www.google.com/maps?q={elem_lat},{elem_lon}"
+        })
+
+    # Sort: 24h open first, then by distance
+    resources.sort(key=lambda r: (not r["is_24h"], r["distance_m"]))
+    return resources[:20]  # Top 20
+
+
+def haversine_distance(lat1, lon1, lat2, lon2) -> float:
+    R = 6371000  # Earth radius in metres
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
+    return R * 2 * math.asin(math.sqrt(a))
+
+def format_distance(metres: float) -> str:
+    if metres < 1000: return f"{int(metres)}m"
+    return f"{metres/1000:.1f}km"
+
+def classify_resource(tags: dict) -> str:
+    amenity = tags.get("amenity", "")
+    healthcare = tags.get("healthcare", "")
+    if amenity == "hospital":       return "hospital"
+    if amenity == "clinic":         return "clinic"
+    if amenity == "pharmacy":       return "pharmacy"
+    if amenity == "police":         return "police"
+    if "shelter" in str(tags.get("social_facility","")): return "shelter"
+    if "psych" in healthcare:       return "mental_health"
+    return "other"
+
+def build_address(tags: dict) -> str:
+    parts = [
+        tags.get("addr:housenumber",""),
+        tags.get("addr:street",""),
+        tags.get("addr:suburb",""),
+        tags.get("addr:city","")
+    ]
+    return ", ".join(p for p in parts if p)
+```
+
+### Leaflet Map Component — React
+
+```javascript
+// frontend/src/components/MapPanel.jsx
+// Uses Leaflet.js + OpenStreetMap tiles (100% free, no API key)
+
+import { MapContainer, TileLayer, Marker, Popup, Circle } from 'react-leaflet';
+import L from 'leaflet';
+
+const RESOURCE_ICONS = {
+  hospital:      "🏥", clinic:    "🏨", pharmacy: "💊",
+  police:        "🚔", shelter:   "🏠", mental_health: "💙",
+  other:         "📍"
+};
+
+const PRIORITY_COLORS = {
+  hospital: "#EF4444", clinic: "#F59E0B",
+  police: "#3B82F6",   pharmacy: "#10B981",
+  shelter: "#8B5CF6",  mental_health: "#06B6D4"
+};
+
+function makeResourceIcon(type) {
+  return L.divIcon({
+    className: "",
+    html: `<div style="font-size:24px;filter:drop-shadow(0 1px 2px rgba(0,0,0,0.3))">
+             ${RESOURCE_ICONS[type] || "📍"}
+           </div>`,
+    iconSize: [30, 30],
+    iconAnchor: [15, 30]
+  });
+}
+
+export function MapPanel({ callerLocation, resources, onDispatch }) {
+  const [selectedResource, setSelectedResource] = useState(null);
+  const [dispatchConfirm, setDispatchConfirm] = useState(null);
+
+  if (!callerLocation) {
+    return (
+      <div className="map-panel map-panel--no-location">
+        <p>Listening for location cues...</p>
+        <p className="hint">Location will auto-detect from caller's speech</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="map-panel">
+      <MapContainer
+        center={[callerLocation.lat, callerLocation.lon]}
+        zoom={14}
+        style={{ height: "280px", width: "100%", borderRadius: "8px" }}
+      >
+        <TileLayer
+          url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+          attribution='© OpenStreetMap contributors'
+        />
+
+        {/* Caller location — pulsing circle */}
+        <Circle
+          center={[callerLocation.lat, callerLocation.lon]}
+          radius={100}
+          pathOptions={{ color: "#EF4444", fillColor: "#EF4444", fillOpacity: 0.3 }}
+        />
+        <Marker
+          position={[callerLocation.lat, callerLocation.lon]}
+          icon={L.divIcon({
+            html: '<div style="background:#EF4444;width:14px;height:14px;border-radius:50%;border:3px solid white;box-shadow:0 0 0 3px rgba(239,68,68,0.4)"></div>',
+            iconSize: [14,14], iconAnchor: [7,7], className: ""
+          })}
+        >
+          <Popup>Caller location</Popup>
+        </Marker>
+
+        {/* Resource markers */}
+        {resources.map(resource => (
+          <Marker
+            key={resource.id}
+            position={[resource.lat, resource.lon]}
+            icon={makeResourceIcon(resource.type)}
+            eventHandlers={{ click: () => setSelectedResource(resource) }}
+          >
+            <Popup>
+              <div className="resource-popup">
+                <strong>{resource.name}</strong>
+                <p>{resource.distance_display} away</p>
+                {resource.phone && <p>📞 {resource.phone}</p>}
+                <p>{resource.is_24h ? "✅ Open 24h" : resource.opening_hours}</p>
+                <button
+                  className="dispatch-btn"
+                  onClick={() => setDispatchConfirm(resource)}
+                >
+                  Dispatch →
+                </button>
+              </div>
+            </Popup>
+          </Marker>
+        ))}
+      </MapContainer>
+
+      {/* Resource list below map — ranked by priority */}
+      <div className="resource-list">
+        {resources.slice(0, 6).map(resource => (
+          <ResourceCard
+            key={resource.id}
+            resource={resource}
+            onDispatch={() => setDispatchConfirm(resource)}
+          />
+        ))}
+      </div>
+
+      {/* Two-step dispatch confirmation modal */}
+      {dispatchConfirm && (
+        <DispatchConfirmModal
+          resource={dispatchConfirm}
+          onConfirm={() => {
+            onDispatch(dispatchConfirm);
+            setDispatchConfirm(null);
+          }}
+          onCancel={() => setDispatchConfirm(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+function DispatchConfirmModal({ resource, onConfirm, onCancel }) {
+  return (
+    <div className="dispatch-modal-overlay">
+      <div className="dispatch-modal">
+        <h3>Confirm dispatch</h3>
+        <p>Send caller to <strong>{resource.name}</strong>?</p>
+        <p>{resource.distance_display} · {resource.address}</p>
+        {resource.phone && <p>Phone: {resource.phone}</p>}
+        <div className="modal-actions">
+          <button className="btn-confirm" onClick={onConfirm}>
+            ✓ Confirm Dispatch
+          </button>
+          <button className="btn-cancel" onClick={onCancel}>Cancel</button>
+        </div>
+        <p className="modal-note">This action will be logged in the audit trail.</p>
+      </div>
+    </div>
+  );
+}
+```
+
+### Dispatch Action — Backend
+
+```python
+# backend/routers/dispatch.py
+
+@app.post("/api/call/{call_id}/dispatch")
+async def dispatch_resource(
+    call_id: str,
+    resource_id: int,
+    resource_name: str,
+    resource_type: str,
+    operator_id: str,
+    notes: str = ""
+):
+    """
+    Logs a dispatch event. In production this would trigger:
+    - SMS to caller with resource address + directions
+    - Notification to resource facility (if API available)
+    - Escalation ticket if resource is police/ambulance
+    
+    For demo: logs the event + shows confirmation on HUD.
+    """
+    dispatch_event = {
+        "call_id": call_id,
+        "operator_id": operator_id,
+        "resource_id": resource_id,
+        "resource_name": resource_name,
+        "resource_type": resource_type,
+        "timestamp": datetime.utcnow().isoformat(),
+        "notes": notes,
+        "status": "dispatched"
+    }
+
+    # Write to immutable audit log (append-only, no UPDATE/DELETE)
+    await db.execute("""
+        INSERT INTO dispatch_events
+        (call_id, operator_id, resource_id, resource_name, resource_type,
+         dispatched_at, notes, status)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+    """, call_id, operator_id, resource_id, resource_name, resource_type,
+        dispatch_event["timestamp"], notes, "dispatched")
+
+    # Publish to Redis for real-time HUD update
+    await redis.publish(f"hud:{call_id}", json.dumps({
+        "type": "dispatch_confirmed",
+        "resource_name": resource_name,
+        "message": f"Help arranged: {resource_name}"
+    }))
+
+    return {"status": "dispatched", "event": dispatch_event}
+```
+
+---
+
+## 7. Backend Architecture
+
+### Project Structure
+
+```
+voiceforward/
+├── backend/
+│   ├── main.py                    # FastAPI app, router registration
+│   ├── config.py                  # Settings, API keys from .env
+│   ├── routers/
+│   │   ├── websocket.py           # Audio WebSocket endpoint
+│   │   ├── calls.py               # Call CRUD + state management
+│   │   ├── dispatch.py            # Resource dispatch
+│   │   ├── sse.py                 # Server-sent events to HUD
+│   │   └── supervisor.py          # Supervisor dashboard API
+│   ├── agents/
+│   │   ├── emotion_agent.py
+│   │   ├── ambient_agent.py
+│   │   ├── narrative_agent.py
+│   │   ├── language_agent.py
+│   │   ├── operator_fatigue_agent.py
+│   │   └── meta_agent.py
+│   ├── services/
+│   │   ├── stt_service.py         # Sarvam + Whisper fallback
+│   │   ├── tts_service.py         # Sarvam TTS
+│   │   ├── location_extractor.py  # NLP location + geocoding
+│   │   ├── resource_fetcher.py    # Overpass API
+│   │   └── audit_logger.py        # Immutable audit trail
+│   ├── models/
+│   │   ├── call_state.py
+│   │   └── schemas.py
+│   └── pipeline/
+│       └── call_pipeline.py       # Orchestrates STT → agents → HUD push
+├── frontend/
+│   ├── src/
+│   │   ├── pages/
+│   │   │   ├── OperatorHUD.jsx
+│   │   │   ├── CallerView.jsx
+│   │   │   └── SupervisorDashboard.jsx
+│   │   ├── components/
+│   │   │   ├── RiskGauge.jsx
+│   │   │   ├── LiveTranscript.jsx
+│   │   │   ├── AIRecommendationCard.jsx
+│   │   │   ├── MapPanel.jsx
+│   │   │   ├── ResourceList.jsx
+│   │   │   ├── DispatchConfirmModal.jsx
+│   │   │   ├── AIDisclosureTimer.jsx
+│   │   │   └── LiveCallsBoard.jsx
+│   │   └── hooks/
+│   │       ├── useAudioStream.js
+│   │       ├── useSSE.js
+│   │       └── useHUDKeyboard.js
+├── docker-compose.yml
+└── requirements.txt
+```
+
+### PostgreSQL Schema
+
+```sql
+-- schema.sql
+
+CREATE TABLE calls (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    started_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    ended_at        TIMESTAMPTZ,
+    state           VARCHAR(20) NOT NULL DEFAULT 'waiting',
+    operator_id     VARCHAR(50),
+    primary_language VARCHAR(10),
+    peak_risk_level VARCHAR(10),
+    outcome_tag     VARCHAR(50),  -- 'de-escalated', 'dispatched', 'transferred', 'unclear'
+    ai_disclosed    BOOLEAN DEFAULT FALSE,
+    caller_opted_out BOOLEAN DEFAULT FALSE,
+    duration_seconds INTEGER GENERATED ALWAYS AS (
+        EXTRACT(EPOCH FROM (ended_at - started_at))::INTEGER
+    ) STORED
+);
+
+CREATE TABLE ai_suggestions (
+    id              BIGSERIAL PRIMARY KEY,
+    call_id         UUID REFERENCES calls(id),
+    suggested_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    risk_level      VARCHAR(10) NOT NULL,
+    confidence      NUMERIC(4,3),
+    reasoning_chain TEXT,
+    recommended_action TEXT,
+    agent_votes     JSONB,
+    operator_response VARCHAR(10),  -- 'accepted', 'modified', 'rejected'
+    operator_response_at TIMESTAMPTZ,
+    operator_notes  TEXT
+    -- NO UPDATE, NO DELETE — append only enforced via trigger
+);
+
+CREATE TABLE transcript_segments (
+    id              BIGSERIAL PRIMARY KEY,
+    call_id         UUID REFERENCES calls(id),
+    segment_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    speaker         VARCHAR(10) NOT NULL,
+    text            TEXT NOT NULL,
+    language        VARCHAR(10),
+    confidence      NUMERIC(4,3),
+    code_switch     BOOLEAN DEFAULT FALSE
+    -- Text retained only during session. Purged by nightly job post-session.
+    -- Pattern vectors extracted to call_patterns before purge.
+);
+
+CREATE TABLE dispatch_events (
+    id              BIGSERIAL PRIMARY KEY,
+    call_id         UUID REFERENCES calls(id),
+    operator_id     VARCHAR(50),
+    resource_id     BIGINT,
+    resource_name   TEXT,
+    resource_type   VARCHAR(30),
+    dispatched_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    notes           TEXT,
+    status          VARCHAR(20) DEFAULT 'dispatched'
+);
+
+CREATE TABLE call_patterns (
+    -- Privacy-preserving aggregate patterns only. No PII.
+    id              BIGSERIAL PRIMARY KEY,
+    extracted_at    TIMESTAMPTZ DEFAULT now(),
+    duration_bucket VARCHAR(20),   -- '0-5min', '5-15min', '15-30min', '30min+'
+    language_mix    VARCHAR(50),   -- 'hi-only', 'hi-en', 'multilingual'
+    risk_trajectory VARCHAR(30),   -- 'escalating', 'stable-high', 'de-escalated'
+    ambient_signals JSONB,         -- aggregate sound flags only
+    outcome_tag     VARCHAR(50),
+    peak_risk       VARCHAR(10),
+    operator_perf_signal VARCHAR(20),  -- 'effective', 'delayed', 'fatigue-flag'
+    -- NO call_id, NO transcript text, NO voice data
+    CONSTRAINT no_pii CHECK (TRUE)  -- Documented intention
+);
+
+-- Prevent deletes and updates on audit tables
+CREATE OR REPLACE FUNCTION prevent_audit_modification()
+RETURNS TRIGGER AS $$
+BEGIN
+    RAISE EXCEPTION 'Audit records are immutable. No UPDATE or DELETE allowed.';
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER no_update_ai_suggestions
+    BEFORE UPDATE OR DELETE ON ai_suggestions
+    FOR EACH ROW EXECUTE FUNCTION prevent_audit_modification();
+```
+
+### Redis Event Bus — All Event Types
+
+```python
+# backend/services/event_bus.py
+
+# All Redis channels used in VoiceForward:
+
+CHANNELS = {
+    # Audio input streams (Redis Streams, not pub/sub)
+    "audio_caller":     "audio:{call_id}:caller",
+    "audio_operator":   "audio:{call_id}:operator",
+
+    # STT output (pub/sub)
+    "transcript":       "transcript:{call_id}",
+
+    # Agent outputs (pub/sub)
+    "agent_emotion":    "agent:{call_id}:emotion",
+    "agent_ambient":    "agent:{call_id}:ambient",
+    "agent_narrative":  "agent:{call_id}:narrative",
+    "agent_language":   "agent:{call_id}:language",
+    "agent_fatigue":    "agent:{call_id}:fatigue",
+
+    # MetaAgent output → HUD
+    "hud_update":       "hud:{call_id}",
+
+    # Location updates
+    "location":         "location:{call_id}",
+
+    # Supervisor alerts
+    "supervisor_alert": "supervisor:alerts",
+
+    # System health
+    "system_health":    "system:health"
+}
+
+# Event payload schemas:
+
+# transcript event:
+# { call_id, text, language, confidence, speaker, code_switch, timestamp }
+
+# hud_update event types:
+# { type: "risk_update", risk_level, confidence, reasoning_chain, recommended_action }
+# { type: "transcript_segment", speaker, text, language }
+# { type: "resource_update", resources: [...] }
+# { type: "dispatch_confirmed", resource_name, message }
+# { type: "operator_fatigue_alert", fatigue_score }
+# { type: "supervisor_escalation_required", reason }
+# { type: "ai_disclosure_required" }  -- fires at call start
+```
+
+### FastAPI Main + Pipeline Orchestrator
+
+```python
+# backend/main.py
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+import asyncio
+
+app = FastAPI(title="VoiceForward API", version="1.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"])
+
+# backend/pipeline/call_pipeline.py
+
+class CallPipeline:
+    """
+    Orchestrates the full pipeline for one active call:
+    Audio chunks → STT → 5 agents (parallel) → MetaAgent → HUD push
+    Target latency: <2 seconds from speech to HUD update.
+    """
+
+    def __init__(self, call_id: str):
+        self.call_id = call_id
+        self.stt = SarvamSTTService()
+        self.emotion_agent    = EmotionAgent()
+        self.ambient_agent    = AmbientAgent()
+        self.narrative_agent  = NarrativeAgent(groq_client)
+        self.language_agent   = LanguageAgent()
+        self.fatigue_agent    = OperatorFatigueAgent()
+        self.meta_agent       = MetaAgent(groq_client)
+        self.language_tracker = LanguageTracker()
+        self.location_extractor = LocationExtractor()
+        self.transcript_window = []
+        self.last_operator_speech_ts = None
+
+    async def process_audio_chunk(self, pcm: bytes, role: str):
+        # Step 1: STT
+        hint_lang = self.language_tracker.primary_language or "unknown"
+        segment = await self.stt.transcribe_chunk(pcm, role, hint_lang)
+
+        if not segment.text.strip():
+            return  # Silence/VAD filtered
+
+        self.transcript_window.append(segment.text)
+        if len(self.transcript_window) > 20:
+            self.transcript_window.pop(0)
+
+        # Publish transcript immediately (zero wait — HUD shows text in real-time)
+        await redis.publish(f"transcript:{self.call_id}", json.dumps({
+            "speaker": role, "text": segment.text,
+            "language": segment.language, "code_switch": segment.code_switch
+        }))
+
+        # Step 2: Run all 5 agents in PARALLEL (not sequential!)
+        response_latency = 0
+        if role == "operator" and self.last_operator_speech_ts:
+            response_latency = int((asyncio.get_event_loop().time() -
+                                   self.last_operator_speech_ts) * 1000)
+
+        results = await asyncio.gather(
+            self.emotion_agent.analyse(pcm, self.call_id)
+                if role == "caller" else asyncio.coroutine(lambda: {"agent":"emotion","risk_contribution":"LOW"})(),
+            self.ambient_agent.analyse(pcm),
+            self.narrative_agent.analyse(segment, self.call_id),
+            self.language_agent.analyse(segment, self.language_tracker),
+            self.fatigue_agent.analyse(pcm, response_latency)
+                if role == "operator" else asyncio.coroutine(lambda: {"agent":"operator_fatigue","risk_contribution":"LOW"})(),
+            return_exceptions=True
+        )
+
+        # Filter out any failed agents (graceful degradation)
+        valid_results = [r for r in results if isinstance(r, dict)]
+
+        # Step 3: MetaAgent
+        meta_result = await self.meta_agent.resolve(valid_results, {
+            "call_id": self.call_id,
+            "transcript_window": self.transcript_window
+        })
+
+        # Step 4: Push to HUD via SSE
+        await redis.publish(f"hud:{self.call_id}", json.dumps({
+            "type": "risk_update",
+            **meta_result
+        }))
+
+        # Step 5: Location extraction (non-blocking, fires async)
+        if role == "caller" and len(self.transcript_window) % 5 == 0:
+            asyncio.create_task(
+                self._update_location(self.transcript_window)
+            )
+
+        if role == "operator":
+            self.last_operator_speech_ts = asyncio.get_event_loop().time()
+
+    async def _update_location(self, transcript_window: list):
+        location = await extract_location_from_transcript(transcript_window)
+        if location:
+            resources = await fetch_nearby_resources(location["lat"], location["lon"])
+            await redis.publish(f"hud:{self.call_id}", json.dumps({
+                "type": "resource_update",
+                "location": location,
+                "resources": resources
+            }))
+```
+
+---
+
+## 8. Frontend Components
+
+### Component Registry
+
+| Component | File | Purpose |
+|-----------|------|---------|
+| `OperatorHUD` | `pages/OperatorHUD.jsx` | Main three-pane layout shell |
+| `LiveCallsBoard` | `components/LiveCallsBoard.jsx` | Active calls list with risk indicators |
+| `RiskGauge` | `components/RiskGauge.jsx` | Smooth animated risk meter |
+| `RiskTimelineBar` | `components/RiskTimelineBar.jsx` | Horizontal timeline of risk over call |
+| `LiveTranscript` | `components/LiveTranscript.jsx` | Auto-scrolling dual-speaker transcript |
+| `GlassBoxPanel` | `components/GlassBoxPanel.jsx` | Reusable panel card component |
+| `AIRecommendationCard` | `components/AIRecommendationCard.jsx` | Reasoning chain + action buttons |
+| `MapPanel` | `components/MapPanel.jsx` | Leaflet map + resource markers |
+| `MapOverlay` | `components/MapOverlay.jsx` | Floating mini-map on main HUD |
+| `ResourceList` | `components/ResourceList.jsx` | Ranked resources with dispatch buttons |
+| `DispatchConfirmModal` | `components/DispatchConfirmModal.jsx` | Two-step dispatch confirmation |
+| `AIDisclosureTimer` | `components/AIDisclosureTimer.jsx` | 30s disclosure countdown |
+| `FatigueIndicator` | `components/FatigueIndicator.jsx` | Operator fatigue signal |
+| `AmbientSoundBadge` | `components/AmbientSoundBadge.jsx` | Shows detected background sounds |
+| `LanguageBadge` | `components/LanguageBadge.jsx` | Current language + code-switch alert |
+| `SupervisorDashboard` | `pages/SupervisorDashboard.jsx` | Aggregate trends + call replay |
+
+### SSE Hook — Real-time HUD Updates
+
+```javascript
+// frontend/src/hooks/useSSE.js
+
+export function useSSE(callId) {
+  const [riskState, setRiskState] = useState({ risk_level: "LOW", confidence: 0.5 });
+  const [transcript, setTranscript] = useState([]);
+  const [resources, setResources] = useState([]);
+  const [callerLocation, setCallerLocation] = useState(null);
+
+  useEffect(() => {
+    const es = new EventSource(`/api/sse/call/${callId}`);
+
+    es.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+
+      switch (data.type) {
+        case "risk_update":
+          setRiskState({
+            risk_level: data.risk_level,
+            confidence: data.confidence,
+            reasoning_chain: data.reasoning_chain,
+            recommended_action: data.recommended_action,
+            agent_votes: data.agent_votes
+          });
+          break;
+
+        case "transcript_segment":
+          setTranscript(prev => [...prev.slice(-100), {
+            speaker: data.speaker,
+            text: data.text,
+            language: data.language,
+            timestamp: Date.now()
+          }]);
+          break;
+
+        case "resource_update":
+          setResources(data.resources);
+          setCallerLocation(data.location);
+          break;
+
+        case "dispatch_confirmed":
+          showToast(`Dispatched: ${data.resource_name}`, "success");
+          break;
+      }
+    };
+
+    return () => es.close();
+  }, [callId]);
+
+  return { riskState, transcript, resources, callerLocation };
+}
+```
+
+### SSE Backend Endpoint
+
+```python
+# backend/routers/sse.py
+
+from fastapi.responses import StreamingResponse
+import asyncio, json
+
+@app.get("/api/sse/call/{call_id}")
+async def call_sse(call_id: str, request: Request):
+    """
+    Server-sent events stream for operator HUD.
+    Subscribes to Redis hud:{call_id} channel.
+    """
+    async def event_generator():
+        pubsub = redis.pubsub()
+        await pubsub.subscribe(f"hud:{call_id}")
+
+        try:
+            async for message in pubsub.listen():
+                if await request.is_disconnected():
+                    break
+                if message["type"] == "message":
+                    yield f"data: {message['data'].decode()}\n\n"
+        finally:
+            await pubsub.unsubscribe(f"hud:{call_id}")
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no"  # Disable nginx buffering
+        }
+    )
+```
+
+---
+
+## 9. DPDPA 2023 Compliance
+
+| DPDPA Requirement | Technical Implementation |
+|-------------------|--------------------------|
+| **Informed consent** | AI disclosure via TTS within 30 seconds of call start. Logged in `calls.ai_disclosed`. |
+| **Opt-out must not degrade experience** | `caller_opted_out = TRUE` → disables AI pipeline, operator continues normally. No quality difference. |
+| **Data minimisation** | Transcript text purged post-session. Only aggregate pattern vectors in `call_patterns`. |
+| **Right to erasure** | `DELETE FROM transcript_segments WHERE call_id = ?` — run on request. Audio never persisted. |
+| **Data localisation** | All services run on Indian cloud region (e.g., AWS ap-south-1 Mumbai). |
+| **No PII in longitudinal store** | `call_patterns` table has CHECK constraint documented as no-PII. No call_id FK, no text, no voice. |
+| **Audit trail** | `ai_suggestions` is append-only via DB trigger. Every AI action + operator response logged. |
+| **Incident replay** | Supervisors can replay call via stored `ai_suggestions` + `transcript_segments` (session-only). |
+| **MeitY AI governance** | All AI recommendations include confidence score and reasoning chain. No autonomous action. |
+
+### Session Purge Job
+
+```python
+# backend/jobs/session_purge.py
+# Runs nightly via cron: 0 3 * * * python session_purge.py
+
+async def purge_ended_sessions():
+    """
+    For all calls ended >24h ago:
+    1. Extract aggregate patterns → call_patterns table
+    2. Delete transcript_segments (contains text)
+    3. Confirm audio was never persisted (Redis Streams auto-expire)
+    """
+    ended_calls = await db.fetch("""
+        SELECT id FROM calls
+        WHERE state = 'ended'
+        AND ended_at < now() - interval '24 hours'
+        AND id NOT IN (SELECT DISTINCT call_id FROM call_patterns)
+    """)
+
+    for call in ended_calls:
+        await extract_and_store_patterns(call["id"])
+        await db.execute(
+            "DELETE FROM transcript_segments WHERE call_id = $1", call["id"]
+        )
+        print(f"Purged session data for call {call['id']}")
+```
+
+---
+
+## 10. Failure Mode Playbook
+
+### Failure 1 — STT Failure (Sarvam unreachable)
+
+```
+DETECTION  HTTP timeout > 5s or status != 200
+IMPACT     Agents receive no transcript → NarrativeAgent and LanguageAgent blind
+ACTION     1. Immediate fallback to faster-whisper (local, zero latency penalty)
+           2. HUD banner: "Using local STT — accuracy may vary"
+           3. EmotionAgent and AmbientAgent continue unaffected (audio-based)
+           4. Log event to system:health Redis channel
+           5. If faster-whisper also fails: HUD shows "TRANSCRIPT UNAVAILABLE"
+              Risk gauge stays at last known value (does NOT reset to LOW)
+              Operator alerted to rely solely on their judgement
+```
+
+### Failure 2 — Emotion Misclassification (High-risk caller rated LOW)
+
+```
+DETECTION  Cannot detect in real-time — this is the hard failure mode
+MITIGATION 7-layer hallucination prevention (see Section 11) reduces false LOW
+           Keyword double-check in NarrativeAgent is independent of EmotionAgent
+           MetaAgent defaults to HIGHER risk when agents disagree
+           Operator can override any rating at any time (A/M/R buttons)
+POST-CALL  Supervisor replay shows AI suggestion vs outcome
+           Flagged cases feed model retraining pipeline
+```
+
+### Failure 3 — Dispatch Error (Resource API fails)
+
+```
+DETECTION  Overpass API timeout or empty results
+ACTION     1. Show cached resources from last successful query
+           2. HUD shows "Map data may be outdated"
+           3. Fallback resource list: hardcoded national helplines always shown
+              - iCall: 9152987821
+              - Vandrevala Foundation: 1860-2662-345
+              - NIMHANS: 080-46110007
+              - Police: 100, Ambulance: 108
+           4. Operator can manually enter resource address for dispatch log
+```
+
+### Failure 4 — Network Degradation (WebSocket drops)
+
+```
+DETECTION  WebSocket onclose event
+ACTION     1. Auto-reconnect with exponential backoff (1s, 2s, 4s, 8s)
+           2. Buffer audio locally during reconnect (IndexedDB, max 30s)
+           3. HUD shows reconnect indicator — does NOT show error modal
+              (modals break operator's call focus)
+           4. On reconnect: flush buffer to server for processing
+           5. If reconnect fails after 4 attempts: fallback to phone-only mode
+              HUD stays visible with last known state frozen
+              All AI features disabled, operator mode only
+```
+
+### Failure 5 — Groq Rate Limit (30 req/min free tier exceeded)
+
+```
+DETECTION  HTTP 429 from Groq API
+ACTION     1. Immediate fallback to local Ollama (llama3.2)
+              Install: curl -fsSL https://ollama.ai/install.sh | sh
+              Pull: ollama pull llama3.2
+           2. Latency increases from ~300ms to ~2-4s — acceptable
+           3. HUD shows subtle indicator: "Using local model"
+           4. NarrativeAgent semantic analysis disabled (most expensive)
+              Keyword check still runs (zero cost)
+           5. Restore Groq when rate window resets (60s)
+```
+
+---
+
+## 11. Hallucination Prevention — 7-Layer System
+
+A hallucination in this system means: the AI reports a false risk level that leads an operator to miss a genuine crisis. Layer 1-4 prevent false confidence. Layers 5-7 catch errors that slip through.
+
+### Layer 1 — Confidence Gating
+
+```python
+# Any agent output with confidence < 0.6 is flagged as uncertain
+# MetaAgent must explicitly note uncertainty in reasoning_chain
+# HUD shows uncertainty indicator: "⚠ Low confidence — rely on your judgement"
+
+def confidence_gate(agent_output: dict) -> dict:
+    if agent_output.get("confidence", 1.0) < 0.6:
+        agent_output["risk_contribution"] = "UNCERTAIN"
+        agent_output["gated"] = True
+    return agent_output
+```
+
+### Layer 2 — Cross-Agent Validation
+
+```python
+# Risk assessments are validated across independent signal types.
+# An EmotionAgent HIGH that contradicts NarrativeAgent LOW triggers
+# an automatic "contradictory signals" flag in MetaAgent output.
+# Contradictory signals → escalate to higher risk, never average down.
+
+def cross_validate(agent_outputs: list) -> list:
+    risk_levels = [o.get("risk_contribution") for o in agent_outputs
+                   if o.get("risk_contribution") != "UNCERTAIN"]
+    if len(set(risk_levels)) > 2:  # More than 2 distinct risk levels
+        for o in agent_outputs:
+            o["cross_validation_flag"] = "high_disagreement"
+    return agent_outputs
+```
+
+### Layer 3 — Keyword Double-Check (Independent of LLM)
+
+```python
+# NarrativeAgent runs keyword matching BEFORE the LLM call.
+# If keywords flag HIGH risk but LLM returns LOW: keyword wins.
+# LLM can only escalate risk from keyword baseline, never reduce it.
+
+def keyword_override(keyword_flags: dict, llm_risk: str) -> str:
+    keyword_risk = "LOW"
+    if keyword_flags.get("finality"):   keyword_risk = "HIGH"
+    if keyword_flags.get("method"):     keyword_risk = "HIGH"
+    if keyword_flags.get("finality") and keyword_flags.get("method"):
+        keyword_risk = "CRITICAL"
+
+    # LLM can ONLY go higher, never lower than keyword baseline
+    if RISK_ORDER[keyword_risk] > RISK_ORDER[llm_risk]:
+        return keyword_risk
+    return llm_risk
+```
+
+### Layer 4 — Structured Output Enforcement
+
+```python
+# All LLM calls use response_format={"type": "json_object"}
+# Response is schema-validated before use
+# Invalid JSON or missing fields → agent marked as FAILED
+# Failed agents are excluded from MetaAgent voting, not treated as LOW
+
+import jsonschema
+
+AGENT_OUTPUT_SCHEMA = {
+    "type": "object",
+    "required": ["risk_level", "reasoning", "confidence"],
+    "properties": {
+        "risk_level": {"type": "string", "enum": ["LOW","MEDIUM","HIGH","CRITICAL"]},
+        "reasoning":  {"type": "string", "minLength": 10},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+    }
+}
+
+def validate_agent_output(output: dict) -> bool:
+    try:
+        jsonschema.validate(output, AGENT_OUTPUT_SCHEMA)
+        return True
+    except jsonschema.ValidationError:
+        return False
+```
+
+### Layer 5 — Conservative Default
+
+```python
+# When in doubt, always default to the higher risk level.
+# This is a system-level invariant, not a per-agent choice.
+# "False HIGH is recoverable. False LOW is not."
+
+SYSTEM_PRINCIPLE = """
+When signals are contradictory, incomplete, or uncertain:
+- Default to HIGHER risk, not LOWER
+- Mark uncertainty explicitly
+- Never present false confidence
+- The operator decides — the AI's job is to surface signal, not make decisions
+"""
+```
+
+### Layer 6 — Temporal Consistency Check
+
+```python
+# Risk cannot drop more than one level per 30 seconds without explanation.
+# If EmotionAgent says CRITICAL then suddenly LOW within 10 seconds:
+# flag as "suspicious_rapid_change" and hold previous risk level.
+
+class RiskTemporalGuard:
+    def __init__(self):
+        self.risk_history = []  # (timestamp, risk_level)
+
+    def check(self, new_risk: str, timestamp: float) -> str:
+        if len(self.risk_history) < 2:
+            self.risk_history.append((timestamp, new_risk))
+            return new_risk
+
+        last_ts, last_risk = self.risk_history[-1]
+        time_delta = timestamp - last_ts
+
+        # Suspicious: dropped from CRITICAL/HIGH to LOW in under 30 seconds
+        if (RISK_ORDER[last_risk] - RISK_ORDER[new_risk] >= 2
+                and time_delta < 30):
+            # Hold the previous level, flag it
+            return last_risk  # Conservative hold
+
+        self.risk_history.append((timestamp, new_risk))
+        return new_risk
+```
+
+### Layer 7 — Audit-Based Learning Loop
+
+```python
+# Every rejected AI suggestion is a training signal.
+# When operator rejects or modifies: record what changed.
+# Weekly batch job analyses rejection patterns:
+# - Which risk levels get rejected most? (over-triggering)
+# - Which calls ended badly despite LOW rating? (under-triggering)
+# Feed into prompt improvements and threshold calibration.
+# This is how the system gets better without retraining models.
+
+async def log_operator_feedback(
+    call_id: str, suggestion_id: int,
+    response: str, notes: str
+):
+    await db.execute("""
+        UPDATE ai_suggestions
+        SET operator_response = $1,
+            operator_response_at = now(),
+            operator_notes = $2
+        WHERE id = $3
+    """, response, notes, suggestion_id)
+    # Note: this is the ONE case where UPDATE is permitted on ai_suggestions
+    # because operator_response is written after the suggestion row is created
+```
+
+---
+
+## Quick-Start Setup
+
+```bash
+# 1. Clone and install
+git clone https://github.com/your-org/voiceforward
+cd voiceforward
+
+# 2. Backend dependencies
+pip install fastapi uvicorn redis asyncpg groq httpx \
+            faster-whisper speechbrain transformers \
+            tensorflow tensorflow-hub librosa numpy \
+            sarvamai jsonschema python-dotenv
+
+# 3. Create .env
+SARVAM_API_KEY=your_sarvam_key_here
+GROQ_API_KEY=your_groq_key_here
+REDIS_URL=redis://localhost:6379
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/voiceforward
+
+# 4. Start infrastructure
+docker-compose up -d  # Redis + PostgreSQL
+
+# 5. Run DB migrations
+psql $DATABASE_URL < schema.sql
+
+# 6. Start backend
+uvicorn backend.main:app --reload --port 8000
+
+# 7. Frontend
+cd frontend && npm install && npm run dev
+
+# 8. Ollama (Groq fallback — optional but recommended)
+curl -fsSL https://ollama.ai/install.sh | sh
+ollama pull llama3.2
+
+# 9. Open caller tab: http://localhost:5173/caller/test-call-001
+#    Open operator tab: http://localhost:5173/operator/test-call-001
+#    Open supervisor:   http://localhost:5173/supervisor
+```
+
+### docker-compose.yml
+
+```yaml
+version: "3.9"
+services:
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    command: redis-server --save 60 1
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: voiceforward
+      POSTGRES_PASSWORD: postgres
+    ports: ["5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+
+volumes:
+  pgdata:
+```
+
+---
+
+*VoiceForward Implementation Guide — SOC1 Hackathon Edition*
+*Stack: FastAPI · Sarvam AI · Groq · SpeechBrain · faster-whisper · Leaflet · React · PostgreSQL · Redis*
+*Total external API cost: ₹0 (all free tiers)*
