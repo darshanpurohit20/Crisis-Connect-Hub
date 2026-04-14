@@ -10,7 +10,9 @@ import OperatorRegister from "@/pages/OperatorRegister";
 import OperatorDashboard from "@/pages/OperatorDashboard";
 import InsightsDashboard from "@/pages/InsightsDashboard";
 import NotFound from "@/pages/not-found";
+import { setBaseUrl } from "@workspace/api-client-react";
 
+setBaseUrl(import.meta.env.VITE_API_URL || "http://localhost:3000");
 const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
