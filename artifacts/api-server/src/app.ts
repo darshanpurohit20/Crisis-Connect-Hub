@@ -7,6 +7,20 @@ import { logger } from "./lib/logger";
 
 const app: Express = express();
 
+// ✅ ALLOW EVERYTHING (for dev)
+app.use(
+  cors({
+    origin: true, // allows ALL origins
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+    credentials: true,
+  }),
+);
+
+// ✅ HANDLE PREFLIGHT (VERY IMPORTANT)
+app.options("*", cors());
+
+// Logger
 app.use(
   (pinoHttp as unknown as typeof import("pino-http").pinoHttp)({
     logger,
@@ -26,7 +40,7 @@ app.use(
     },
   }),
 );
-app.use(cors());
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
